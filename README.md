@@ -4,7 +4,7 @@ Addon para MK-AUTH que documenta a planta FTTH: caixas e cabos no mapa, importa�
 projeto, diagrama de emendas de cada CEO/CTO, POP com OLT e DIO, e cálculo de potência do sinal
 que chega em cada cliente.
 
-> **Versão 0.9.10 — versão mantida em Negorth/PowerMaps.** Derivada do FTTH Doc de Marcelo Silvestro, com o aviso de copyright e a licença MIT preservados. Esta é a
+> **Versão 0.9.11 — versão mantida em Negorth/PowerMaps.** Derivada do FTTH Doc de Marcelo Silvestro, com o aviso de copyright e a licença MIT preservados. Esta é a
 > versão atualmente mantida neste repositório. Instale primeiro num servidor de teste.
 
 ## Instalação

@@ -18,6 +18,7 @@
     var areaCarregada = null, requisicaoMapa = 0, requisicaoClientes = 0;
     var rotulosGoogle = null;
     var modo = 'navegar';                       // navegar | caixa
+    var pontosMedicao = [], marcadoresMedicao = [], linhaMedicao = null;
     var vaoAtivoMoverId = null;                  // só este vão recebe alças de edição
     var linhaAtivaMover = null;
     var marcadorVerticeRotaMover = null;
@@ -502,6 +503,10 @@
                 m.setAnimation(google.maps.Animation.BOUNCE);
             }
             m.addListener('click', function () {
+                if (modo === 'medir') {
+                    adicionarPontoMedicao(m.getPosition());
+                    return;
+                }
                 if (modo === 'mover' && vinculoMeioMover) {
                     vincularMeioAoObjetoMover(c);
                     return;
@@ -593,6 +598,10 @@
                 l.ftthPeso = destacarOtdr ? Math.max(espessura + 3, 8) : espessura;
                 l.ftthOpacidade = destacarOtdr ? 1 : (destaque ? 0.35 : 0.95);
                 l.addListener('click', function (e) {
+                    if (modo === 'medir') {
+                        if (e && e.latLng) adicionarPontoMedicao(e.latLng);
+                        return;
+                    }
                     if (modo === 'mover') {
                         if (vinculoMeioMover) {
                             FTTH.toast('info', 'Escolha uma CTO ou CEO no mapa, ou cancele o vínculo atual.');
@@ -618,7 +627,7 @@
                         cliqueCaboSelecionar(v.cabo_id);
                         return;
                     }
-                    if (modo === 'caixa' || modo === 'cabo' || modo === 'selecionar') {
+                    if (modo === 'caixa' || modo === 'cabo' || modo === 'selecionar' || modo === 'medir') {
                         cliqueNoMapa(e);
                         return;
                     }
@@ -643,7 +652,13 @@
                         title: (q.nome || '') + ' — não revisado',
                         zIndex: Z_QUARENTENA
                     });
-                    m.addListener('click', function () { abrirQuarentena(q); });
+                    m.addListener('click', function () {
+                        if (modo === 'medir') {
+                            adicionarPontoMedicao(m.getPosition());
+                            return;
+                        }
+                        abrirQuarentena(q);
+                    });
                     quarentenaObj.push(m);
                 } else {
                     var caminho = q.geo.map(function (p) {
@@ -657,7 +672,13 @@
                         strokeOpacity: 0.4,
                         zIndex: Z_QUARENTENA
                     });
-                    l.addListener('click', function () { abrirQuarentena(q); });
+                    l.addListener('click', function (e) {
+                        if (modo === 'medir') {
+                            if (e && e.latLng) adicionarPontoMedicao(e.latLng);
+                            return;
+                        }
+                        abrirQuarentena(q);
+                    });
                     quarentenaObj.push(l);
                 }
             });
@@ -1811,7 +1832,7 @@
     function ajustarToasts() {
         var raiz = document.documentElement;
         var estreita = window.matchMedia && window.matchMedia('(max-width: 470px)').matches;
-        var card = $('#cabo-card:visible, #mover-card:visible, #regiao-card:visible, #sel-card:visible, #sel-barra:visible').get(0);
+        var card = $('#cabo-card:visible, #mover-card:visible, #medir-card:visible, #regiao-card:visible, #sel-card:visible, #sel-barra:visible').get(0);
         if (estreita && card) {
             var topo = card.getBoundingClientRect().top;
             raiz.style.setProperty('--ftth-toast-base', Math.max(20, window.innerHeight - topo + 8) + 'px');
@@ -2030,6 +2051,10 @@
             limparSelecao();
             $('#sel-card, #sel-barra, #modal-lote, #modal-cor-lote').hide();
         }
+        if (modo === 'medir' && novo !== 'medir') {
+            limparMedicao();
+            $('#medir-card').hide();
+        }
 
         modo = novo;
         $('.ftth-modo').removeClass('ativo');
@@ -2078,6 +2103,10 @@
             ajustarToasts();
             atualizarContaMover();
             carregar();                 // redesenha com os marcadores arrastáveis
+        } else if (novo === 'medir') {
+            limparMedicao();
+            $('#medir-card').show();
+            ajustarToasts();
         } else {
             $('#cabo-dica').text('');
         }
@@ -3327,7 +3356,7 @@
      * de dois lugares: do mapa e de cima de um cabo, que é um objeto por cima do mapa.
      */
     function modoDeDesenho(m) {
-        return m === 'caixa' || m === 'cabo' || m === 'selecionar';
+        return m === 'caixa' || m === 'cabo' || m === 'selecionar' || m === 'medir';
     }
 
     function cursorDoCabo() {
@@ -3335,6 +3364,10 @@
     }
 
     function cliqueNoMapa(e) {
+        if (modo === 'medir') {
+            adicionarPontoMedicao(e.latLng);
+            return;
+        }
         if (callbackPontoViabilidade && callbackPontoViabilidade(e.latLng)) return;
         if (modo === 'caixa') {
             marcarPonto(e.latLng);
@@ -3349,6 +3382,60 @@
             return;
         }
         $('#painel').hide();
+    }
+
+    /** Marca até dois pontos e exibe a distância geográfica aproximada entre eles. */
+    function adicionarPontoMedicao(latLng) {
+        if (!latLng || modo !== 'medir') return;
+        if (pontosMedicao.length >= 2) {
+            FTTH.toast('info', 'Use Limpar para iniciar outra medição.');
+            return;
+        }
+        pontosMedicao.push(latLng);
+        var rotulo = pontosMedicao.length === 1 ? 'A' : 'B';
+        var cor = pontosMedicao.length === 1 ? '#00A86B' : '#E53935';
+        marcadoresMedicao.push(new google.maps.Marker({
+            position: latLng, map: mapa, title: 'Ponto ' + rotulo + ' da medição',
+            clickable: false, zIndex: Z_CAIXA + 200,
+            icon: { path: google.maps.SymbolPath.CIRCLE, scale: 9, fillColor: cor,
+                    fillOpacity: 1, strokeColor: '#FFFFFF', strokeWeight: 2 },
+            label: { text: rotulo, color: '#FFFFFF', fontSize: '10px', fontWeight: '700' }
+        }));
+        if (pontosMedicao.length === 1) {
+            $('#medir-status').text('Ponto A marcado. Clique para escolher o destino.');
+            $('#medir-distancia').text('');
+            return;
+        }
+        linhaMedicao = new google.maps.Polyline({
+            map: mapa, path: pontosMedicao, geodesic: true, clickable: false,
+            strokeColor: '#00AEEF', strokeOpacity: 1, strokeWeight: 4, zIndex: Z_CAIXA + 199
+        });
+        var metros = distanciaEntrePontos(pontosMedicao[0], pontosMedicao[1]);
+        var texto = metros < 1000
+            ? Math.round(metros).toLocaleString('pt-BR') + ' m'
+            : (metros / 1000).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' km';
+        $('#medir-status').text('Distância entre os pontos A e B');
+        $('#medir-distancia').text(texto);
+    }
+
+    function distanciaEntrePontos(a, b) {
+        var raioTerra = 6371008.8, rad = Math.PI / 180;
+        var lat1 = a.lat() * rad, lat2 = b.lat() * rad;
+        var deltaLat = (b.lat() - a.lat()) * rad, deltaLng = (b.lng() - a.lng()) * rad;
+        var senoLat = Math.sin(deltaLat / 2), senoLng = Math.sin(deltaLng / 2);
+        var h = senoLat * senoLat + Math.cos(lat1) * Math.cos(lat2) * senoLng * senoLng;
+        h = Math.min(1, Math.max(0, h));
+        return 2 * raioTerra * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+    }
+
+    function limparMedicao() {
+        marcadoresMedicao.forEach(function (m) { m.setMap(null); });
+        marcadoresMedicao = [];
+        if (linhaMedicao) linhaMedicao.setMap(null);
+        linhaMedicao = null;
+        pontosMedicao = [];
+        $('#medir-status').text('Clique no mapa para marcar o ponto inicial.');
+        $('#medir-distancia').text('');
     }
 
     function limparPin() {
@@ -4437,6 +4524,8 @@
             atualizarTracado();
         });
         $('#cabo-finalizar').on('click', finalizarTracado);
+        $('#medir-limpar').on('click', limparMedicao);
+        $('#medir-fechar').on('click', function () { definirModo('navegar'); });
         // Cancelar é o par do Finalizar, como no modo edição: os dois encerram o desenho.
         $('#cabo-cancelar').on('click', function () {
             if (tracado.length && !confirm('Descartar o traçado e sair do modo Cabo?')) return;

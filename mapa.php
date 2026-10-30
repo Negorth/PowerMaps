@@ -683,6 +683,8 @@ include('nav/header.php');
                 <i class="bi-share-fill"></i> Cabo</button>
             <button class="ftth-modo" data-modo="mover">
                 <i class="bi-arrows-move"></i> Mover</button>
+            <button class="ftth-modo" data-modo="medir" title="Medir distância em linha reta entre dois pontos">
+                <i class="bi-rulers"></i> Medir</button>
         </div>
 
         <div class="ftth-busca">
@@ -1074,6 +1076,20 @@ include('nav/header.php');
                 <i class="bi-arrow-counterclockwise"></i> Desfazer</button>
             <button class="ftth-btn ftth-btn--pri" id="cabo-finalizar">
                 <i class="bi-check-circle-fill"></i> Finalizar</button>
+        </div>
+
+        <!-- Medição temporária entre dois pontos; não altera os dados da rede. -->
+        <div id="medir-card" class="ftth-flutuante ftth-flutuante--medir" style="display:none">
+            <div class="ftth-flutuante-info">
+                <strong><i class="bi-rulers"></i> Medir distância</strong>
+                <span id="medir-status">Clique no mapa para marcar o ponto inicial.</span>
+                <span id="medir-distancia" class="ftth-medida-resultado"></span>
+                <span class="ftth-flutuante-dica">Distância aproximada em linha reta.</span>
+            </div>
+            <button type="button" class="ftth-btn ftth-btn--sec" id="medir-limpar">
+                <i class="bi-arrow-counterclockwise"></i> Limpar</button>
+            <button type="button" class="ftth-btn ftth-btn--sec" id="medir-fechar">
+                <i class="bi-x-lg"></i> Sair</button>
         </div>
 
         <!-- Editor de rota: aparece somente quando um cabo é selecionado no modo Mover. -->

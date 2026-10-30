@@ -727,6 +727,9 @@ html.ftth-sem-scroll body { overflow: hidden; height: 100%; }
    "em andamento e será criado"; este diz "em edição, e você ainda pode desistir". */
 .ftth-flutuante--edicao .ftth-flutuante-info strong { color: var(--ftth-amarelo); }
 .ftth-flutuante--edicao { border: 1px solid rgba(232, 163, 23, .5); }
+.ftth-flutuante--medir { border: 1px solid rgba(72, 187, 255, .55); }
+.ftth-flutuante--medir .ftth-flutuante-info strong { color: #80D8FF; }
+.ftth-medida-resultado { font-size: 17px !important; font-weight: 700; color: #fff; }
 .ftth-flutuante-conta   { font-size: 11.5px; font-weight: 600; color: #C9D6E8;
                           border-left: 1px solid rgba(255,255,255,.18); padding-left: 10px;
                           white-space: nowrap; }
@@ -890,6 +893,7 @@ html.ftth-sem-scroll body { overflow: hidden; height: 100%; }
                            gap: 0 8px; margin: 0; padding: 0 2px; min-width: 0; }
     #cabo-card .ftth-flutuante-info  { flex: 1 1 0; }
     #mover-card .ftth-flutuante-info { flex: 1 1 0; }
+    #medir-card .ftth-flutuante-info { flex: 1 1 0; }
     .ftth-flutuante-dica { flex: 1 1 100%; margin-top: 1px; white-space: nowrap;
                            overflow: hidden; text-overflow: ellipsis; }
     #mover-dica          { display: none; }
@@ -899,6 +903,7 @@ html.ftth-sem-scroll body { overflow: hidden; height: 100%; }
     #mover-card #mover-ponta-soltar { flex: 1 1 calc(50% - 4px); }
     #mover-card #mover-vinculo-cancelar { flex: 1 1 calc(50% - 4px); }
     #cabo-card .ftth-btn  { flex: 1 1 calc(33.33% - 6px); }
+    #medir-card .ftth-btn { flex: 1 1 calc(50% - 4px); }
 }
 
 /* Silhueta da peça (Caixa::SILHUETAS) usada em titulo e em botao, ao lado de texto.
