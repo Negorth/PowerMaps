@@ -1,0 +1,1629 @@
+<?php
+/**
+ * ftth_doc :: mapa — a tela principal do addon.
+ *
+ * Carrega sempre por região + área visível (bbox), nunca a rede inteira (3b.12).
+ * Itens ainda em quarentena aparecem translúcidos, com aviso — são "não revisados" (U3).
+ */
+require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/lib/Regiao.php';
+require_once __DIR__ . '/lib/Mapa.php';
+require_once __DIR__ . '/lib/Quarentena.php';
+require_once __DIR__ . '/lib/Caixa.php';
+require_once __DIR__ . '/lib/Cabo.php';
+require_once __DIR__ . '/lib/Topologia.php';
+require_once __DIR__ . '/lib/Instalacao.php';
+require_once __DIR__ . '/lib/Ajustes.php';
+require_once __DIR__ . '/lib/PrimeirosPassos.php';
+require_once __DIR__ . '/lib/Lote.php';
+require_once __DIR__ . '/lib/KmzExport.php';
+require_once __DIR__ . '/lib/Viabilidade.php';
+
+/**
+ * Os parâmetros da exportação, iguais para contar e para baixar. Com `caixas` (modo
+ * Selecionar) vale a lista; sem, os tipos marcados — da região aberta ou de todas.
+ */
+function ftth_dados_exportacao(): array
+{
+    $regiaoId = (int) ($_POST['regiao'] ?? 0);
+    if (isset($_POST['caixas'])) {
+        $caixas = json_decode((string) $_POST['caixas'], true);
+        $cabos  = json_decode((string) ($_POST['cabos_sel'] ?? '[]'), true);
+        return KmzExport::dados([$regiaoId], [], false,
+                                is_array($caixas) ? $caixas : [], is_array($cabos) ? $cabos : []);
+    }
+    $regioes = ($_POST['todas'] ?? '') === '1'
+        ? array_map('intval', array_column(Regiao::listar(), 'id')) : [$regiaoId];
+    $grupos = json_decode((string) ($_POST['tipos'] ?? '[]'), true);
+    return KmzExport::dados($regioes, is_array($grupos) ? $grupos : [], ($_POST['cabos'] ?? '') === '1');
+}
+
+/** Converte bbox lat/lng e recusa valores fora das faixas geográficas. */
+function ftth_bbox(string $texto): ?array
+{
+    $partes = array_map('trim', explode(',', $texto));
+    if (count($partes) !== 4) {
+        return null;
+    }
+    foreach ($partes as $parte) {
+        if (!is_numeric($parte)) {
+            return null;
+        }
+    }
+    $p = array_map('floatval', $partes);
+    $bbox = [min($p[0], $p[2]), min($p[1], $p[3]), max($p[0], $p[2]), max($p[1], $p[3])];
+    if ($bbox[0] < -90 || $bbox[2] > 90 || $bbox[1] < -180 || $bbox[3] > 180) {
+        return null;
+    }
+    return $bbox;
+}
+
+/* ------------------------------------------------------------------ AJAX */
+if (isset($_GET['ajax'])) {
+    try {
+        switch ($_GET['ajax']) {
+            case 'elementos':
+                $regiaoId = (int) ($_GET['regiao'] ?? 0);
+                $bbox = null;
+                if (!empty($_GET['bbox'])) {
+                    $p = array_map('floatval', explode(',', (string) $_GET['bbox']));
+                    if (count($p) === 4) {
+                        $bbox = [min($p[0], $p[2]), min($p[1], $p[3]), max($p[0], $p[2]), max($p[1], $p[3])];
+                    }
+                }
+                $dados = Mapa::elementos($regiaoId, $bbox, [
+                    'quarentena' => ($_GET['quarentena'] ?? '1') === '1',
+                ]);
+                $dados['contadores'] = Quarentena::contar($regiaoId);
+                Resultado::ok($dados)->enviar();
+
+            // Regiões: moram no painel lateral do mapa desde 24/09/2026 (antes, regioes.php).
+            // Centro e zoom vêm sempre da vista do mapa, nunca digitados.
+            case 'regioes':
+                Resultado::ok(['regioes' => Regiao::listar()])->enviar();
+
+            case 'regiao_criar':
+                ftth_exigir_csrf();
+                Regiao::criar(
+                    (string) ($_POST['nome'] ?? ''),
+                    (float) ($_POST['lat'] ?? 0),
+                    (float) ($_POST['lng'] ?? 0),
+                    (int) ($_POST['zoom'] ?? 15),
+                    $usuario_logado
+                )->enviar();
+
+            case 'regiao_alterar':
+                ftth_exigir_csrf();
+                $atual = Regiao::obter((int) ($_POST['id'] ?? 0));
+                if (!$atual) {
+                    Resultado::erro('FTTH-TOP-001', [], 'Região não encontrada.')->enviar(404);
+                }
+                // Renomear não mexe no centro; "usar esta vista" não mexe no nome.
+                $comVista = ($_POST['lat'] ?? '') !== '' && ($_POST['lng'] ?? '') !== '';
+                Regiao::alterar(
+                    (int) $atual['id'],
+                    isset($_POST['nome']) ? (string) $_POST['nome'] : (string) $atual['nome'],
+                    $comVista ? (float) $_POST['lat'] : ($atual['lat'] !== null ? (float) $atual['lat'] : null),
+                    $comVista ? (float) $_POST['lng'] : ($atual['lng'] !== null ? (float) $atual['lng'] : null),
+                    $comVista ? (int) ($_POST['zoom'] ?? 15) : (int) $atual['zoom'],
+                    isset($_POST['versao']) && $_POST['versao'] !== '' ? (int) $_POST['versao'] : null,
+                    $usuario_logado
+                )->enviar();
+
+            case 'regiao_excluir':
+                ftth_exigir_csrf();
+                Regiao::excluir(
+                    (int) ($_POST['id'] ?? 0),
+                    isset($_POST['versao']) && $_POST['versao'] !== '' ? (int) $_POST['versao'] : null,
+                    $usuario_logado
+                )->enviar();
+
+            // Aba Ajustes do painel (e o campo da chave na primeira instalação).
+            case 'ajustes':
+                ftth_exigir_csrf();
+                Resultado::ok(Ajustes::salvar($_POST, $usuario_logado))->enviar();
+
+            // Camadas marcadas na aba Camadas: por usuário, gravadas a cada clique.
+            case 'camadas':
+                ftth_exigir_csrf();
+                $cams = json_decode((string) ($_POST['camadas'] ?? '{}'), true);
+                Resultado::ok(Ajustes::salvarCamadas(is_array($cams) ? $cams : [], $usuario_logado))->enviar();
+
+            // Primeiros passos: o estado sai do banco, e a tela pede de novo a cada mudança.
+            case 'passos':
+                Resultado::ok(PrimeirosPassos::estado())->enviar();
+
+            case 'passos_pular':
+                ftth_exigir_csrf();
+                Resultado::ok(PrimeirosPassos::pular(($_POST['pular'] ?? '1') === '1',
+                                                     $usuario_logado))->enviar();
+
+            // Só quando a aba Ajustes abre: não pesa a abertura do mapa.
+            case 'estado':
+                Resultado::ok(Ajustes::estado())->enviar();
+
+            case 'pontos':
+                Resultado::ok(['pontos' => Mapa::pontos((int) ($_GET['regiao'] ?? 0))])->enviar();
+
+            case 'buscar':
+                Resultado::ok(['resultados' => Mapa::buscar(
+                    (int) ($_GET['regiao'] ?? 0), (string) ($_GET['q'] ?? ''))])->enviar();
+
+            case 'viabilidade':
+                $lat = filter_var($_GET['lat'] ?? null, FILTER_VALIDATE_FLOAT);
+                $lng = filter_var($_GET['lng'] ?? null, FILTER_VALIDATE_FLOAT);
+                $raio = GeoTools::raio($_GET['raio'] ?? null);
+                if ($lat === false || $lng === false || $lat < -90 || $lat > 90 || $lng < -180 || $lng > 180
+                    || $raio === null) {
+                    Resultado::erro('FTTH-SYS-002', [], 'Informe coordenadas válidas e um raio entre 100 e 5000 metros.')
+                        ->enviar(400);
+                }
+                Resultado::ok(['raio_m' => $raio, 'ctos' => Viabilidade::buscar((float) $lat, (float) $lng, $raio),
+                    'medida' => 'linha_reta'])->enviar();
+
+            case 'clientes_mapa':
+                $bbox = ftth_bbox((string) ($_GET['bbox'] ?? ''));
+                Resultado::ok(['clientes' => Mapa::clientesMapa(
+                    (int) ($_GET['regiao'] ?? 0), $bbox, '', 500)])->enviar();
+
+            case 'clientes_sem_localizacao':
+                Resultado::ok(Mapa::clientesSemLocalizacao(
+                    (string) ($_GET['q'] ?? ''), (int) ($_GET['offset'] ?? 0), 50))->enviar();
+
+            case 'instalacao_dados':
+                $dados = Instalacao::listar((int) ($_GET['cliente'] ?? 0));
+                $dados ? Resultado::ok($dados)->enviar() : Resultado::erro(
+                    'FTTH-SYS-002', ['cliente_id' => (int) ($_GET['cliente'] ?? 0)],
+                    'Cliente não encontrado.')->enviar(404);
+
+            case 'ctos_buscar':
+                $termo = trim((string) ($_GET['q'] ?? ''));
+                $regiaoId = (int) ($_GET['regiao'] ?? 0);
+                if ($regiaoId < 1 || mb_strlen($termo) < 2) {
+                    Resultado::ok(['ctos' => []])->enviar();
+                }
+                $like = '%' . $termo . '%';
+                Resultado::ok(['ctos' => Db::todos(
+                    'SELECT id, nome, tipo, lat, lng FROM tab_ftth_caixa
+                      WHERE regiao_id = ? AND excluido_em IS NULL
+                        AND tipo IN ("CTO", "CTO_AP") AND nome LIKE ?
+                      ORDER BY nome LIMIT 30', [$regiaoId, $like])])->enviar();
+
+            case 'opcoes_cto':
+                $caixaId = (int) ($_GET['caixa'] ?? 0);
+                Resultado::ok([
+                    'splitters' => Topologia::splittersDeAtendimento($caixaId),
+                    'portas' => Topologia::portas($caixaId),
+                ])->enviar();
+
+            case 'instalacao_criar':
+                ftth_exigir_csrf();
+                Instalacao::criar(
+                    (int) ($_POST['cliente'] ?? 0), (string) ($_POST['identificacao'] ?? ''),
+                    (string) ($_POST['endereco'] ?? ''), $_POST['lat'] ?? null, $_POST['lng'] ?? null,
+                    (string) ($_POST['observacao'] ?? ''), $usuario_logado
+                )->enviar();
+
+            case 'instalacao_alterar':
+                ftth_exigir_csrf();
+                Instalacao::alterar(
+                    (int) ($_POST['id'] ?? 0), (int) ($_POST['cliente'] ?? 0),
+                    (string) ($_POST['identificacao'] ?? ''), (string) ($_POST['endereco'] ?? ''),
+                    $_POST['lat'] ?? null, $_POST['lng'] ?? null,
+                    (string) ($_POST['observacao'] ?? ''), $usuario_logado
+                )->enviar();
+
+            case 'instalacao_excluir':
+                ftth_exigir_csrf();
+                Instalacao::excluir((int) ($_POST['id'] ?? 0),
+                    (int) ($_POST['cliente'] ?? 0))->enviar();
+
+            case 'instalacao_vincular':
+                ftth_exigir_csrf();
+                Instalacao::vincular(
+                    (int) ($_POST['id'] ?? 0), (int) ($_POST['cliente'] ?? 0),
+                    (int) ($_POST['splitter'] ?? 0), (int) ($_POST['numero'] ?? 0), $usuario_logado
+                )->enviar();
+
+            case 'instalacao_desvincular':
+                ftth_exigir_csrf();
+                Instalacao::desvincular((int) ($_POST['id'] ?? 0),
+                    (int) ($_POST['cliente'] ?? 0), $usuario_logado)->enviar();
+
+            case 'ficha':
+                $f = Mapa::ficha((int) ($_GET['id'] ?? 0));
+                $f ? Resultado::ok($f)->enviar() : Resultado::erro('FTTH-TOP-001')->enviar(404);
+
+            // Prévia da extremidade selecionada no modo Mover. A mutação é confirmada em POST.
+            case 'vao_ponta_previa':
+                $previa = Cabo::previaPonta((int) ($_GET['vao'] ?? 0), (string) ($_GET['lado'] ?? ''));
+                $previa ? Resultado::ok($previa)->enviar()
+                        : Resultado::erro('FTTH-TOP-002', [], 'Ponta de cabo não encontrada.')->enviar(404);
+
+            case 'vao_ponta_alterar':
+                ftth_exigir_csrf();
+                $alvoRaw = trim((string) ($_POST['caixa'] ?? ''));
+                Cabo::alterarPonta(
+                    (int) ($_POST['vao'] ?? 0),
+                    (string) ($_POST['lado'] ?? ''),
+                    $alvoRaw === '' ? null : (int) $alvoRaw,
+                    isset($_POST['versao']) ? (int) $_POST['versao'] : null,
+                    $usuario_logado
+                )->enviar();
+
+            // Importar/descartar direto do mapa, sem passar pela tela de importação:
+            // é a mesma camada de serviço que a tela usa (3b.0).
+            case 'nova_caixa':
+                ftth_exigir_csrf();
+                Caixa::criar(
+                    (int) ($_POST['regiao'] ?? 0),
+                    (string) ($_POST['tipo'] ?? ''),
+                    (string) ($_POST['nome'] ?? ''),
+                    (string) ($_POST['cor'] ?? '#00C853'),
+                    (float) ($_POST['lat'] ?? 0),
+                    (float) ($_POST['lng'] ?? 0),
+                    $usuario_logado,
+                    ['reserva_m' => $_POST['reserva_m'] ?? null]
+                )->enviar();
+
+            // Você soltou a caixa em cima de um cabo? Consulta pura: quem decide emendar é o
+            // usuário, na confirmação que a tela mostra com estes dados.
+            case 'vao_sob_ponto':
+                // Ponta livre por perto tem prioridade: o ponto novo assume a ponta do cabo
+                // (Caixa::criar faz isso sozinho), e a pergunta da emenda não cabe ali.
+                if (($_GET['caixa'] ?? '') === '') {
+                    $ponta = Caixa::pontaProxima((int) ($_GET['regiao'] ?? 0),
+                        (float) ($_GET['lat'] ?? 0), (float) ($_GET['lng'] ?? 0));
+                    if ($ponta !== null) {
+                        Resultado::ok(['vao' => null, 'ponta' => (int) $ponta['id']])->enviar();
+                    }
+                }
+                $achado = Cabo::vaoSobPonto(
+                    (int) ($_GET['regiao'] ?? 0),
+                    (float) ($_GET['lat'] ?? 0),
+                    (float) ($_GET['lng'] ?? 0),
+                    ($_GET['caixa'] ?? '') !== '' ? (int) $_GET['caixa'] : null
+                );
+                Resultado::ok($achado === null ? ['vao' => null] : [
+                    'vao'         => (int) $achado['vao']['id'],
+                    'cabo'        => (int) $achado['vao']['cabo_id'],
+                    'cabo_nome'   => $achado['vao']['cabo_nome'],
+                    'cabo_tipo'   => $achado['vao']['cabo_tipo'],
+                    'fibras'      => (int) $achado['vao']['fibras'],
+                    'distancia_m' => $achado['projecao']['distancia_m'],
+                    'raio_m'      => Cabo::raioQuebra(),
+                ])->enviar();
+
+            case 'quebrar_vao':
+                ftth_exigir_csrf();
+                Cabo::quebrarVao(
+                    (int) ($_POST['vao'] ?? 0),
+                    (int) ($_POST['caixa'] ?? 0),
+                    $usuario_logado
+                )->enviar();
+
+            case 'novo_cabo':
+                ftth_exigir_csrf();
+                $pontos = json_decode((string) ($_POST['pontos'] ?? '[]'), true);
+                if (!is_array($pontos)) {
+                    Resultado::erro('FTTH-SYS-002', ['campo' => 'pontos'])->enviar(400);
+                }
+                Cabo::criar(
+                    (int) ($_POST['regiao'] ?? 0),
+                    [
+                        'nome'         => (string) ($_POST['nome'] ?? ''),
+                        'fabricante'   => (string) ($_POST['fabricante'] ?? ''),
+                        'cabo_tipo_id' => (int) ($_POST['cabo_tipo_id'] ?? 0),
+                        'padrao_cores' => (string) ($_POST['padrao_cores'] ?? 'ABNT'),
+                        'cor_rota'     => (string) ($_POST['cor_rota'] ?? '#00E676'),
+                        'espessura_mapa' => $_POST['espessura_mapa'] ?? null,
+                        'continuar_de' => (int) ($_POST['continuar_de'] ?? 0),
+                    ],
+                    $pontos,
+                    $usuario_logado
+                )->enviar();
+
+            case 'alterar_cabo':
+                ftth_exigir_csrf();
+                Cabo::alterar(
+                    (int) ($_POST['cabo'] ?? 0),
+                    [
+                        'nome'         => $_POST['nome'] ?? '',
+                        'fabricante'   => $_POST['fabricante'] ?? '',
+                        'cabo_tipo_id' => (int) ($_POST['cabo_tipo_id'] ?? 0),
+                        'padrao_cores' => $_POST['padrao_cores'] ?? '',
+                        'cor_rota'     => $_POST['cor_rota'] ?? '',
+                        'espessura_mapa' => $_POST['espessura_mapa'] ?? null,
+                        'status'       => $_POST['status'] ?? '',
+                    ],
+                    isset($_POST['versao']) ? (int) $_POST['versao'] : null,
+                    $usuario_logado
+                )->enviar();
+
+            // Prévia do modal "Excluir cabo": o que sai junto. Consulta pura.
+            case 'cabo_previa':
+                $previa = Cabo::previaExclusao((int) ($_GET['cabo'] ?? 0));
+                ($previa === null
+                    ? Resultado::erro('FTTH-TOP-002', [], 'Cabo não encontrado.')
+                    : Resultado::ok($previa))->enviar();
+
+            case 'excluir_cabo':
+                ftth_exigir_csrf();
+                // Com fibra ligada, só desliga tudo e exclui quando vem a confirmação do modal.
+                Cabo::excluir((int) ($_POST['cabo'] ?? 0), $usuario_logado,
+                    strtoupper(trim((string) ($_POST['confirmacao'] ?? ''))) === 'EXCLUIR')->enviar();
+
+            case 'alterar_caixa':
+                ftth_exigir_csrf();
+                Caixa::alterar(
+                    (int) ($_POST['id'] ?? 0),
+                    [
+                        'nome'       => (string) ($_POST['nome'] ?? ''),
+                        'tipo'       => (string) ($_POST['tipo'] ?? ''),
+                        'cor'        => (string) ($_POST['cor'] ?? ''),
+                    ] + (isset($_POST['reserva_m']) ? ['reserva_m' => $_POST['reserva_m']] : []),
+                    isset($_POST['versao']) ? (int) $_POST['versao'] : null,
+                    $usuario_logado
+                )->enviar();
+
+            // Modo Mover: caixas e traçados vão juntos, numa transação só. Um mapa meio
+            // movido seria pior do que um mapa não movido.
+            case 'mover':
+                ftth_exigir_csrf();
+                $caixas = json_decode((string) ($_POST['caixas'] ?? '[]'), true);
+                $vaos   = json_decode((string) ($_POST['vaos'] ?? '[]'), true);
+                $ancoras = json_decode((string) ($_POST['ancoras'] ?? '[]'), true);
+                if (!is_array($caixas) || !is_array($vaos) || !is_array($ancoras)) {
+                    Resultado::erro('FTTH-SYS-002', ['campo' => 'movimentos'])->enviar(400);
+                }
+                Mapa::aplicarMovimentos($caixas, $vaos, $usuario_logado, $ancoras)->enviar();
+
+            // A caixa é só uma emenda no meio de um cabo? Consulta pura: a tela usa isto para
+            // avisar que excluir vai juntar os dois trechos, antes de fazer.
+            case 'emenda_simples':
+                Resultado::ok(['emenda' => Cabo::emendaSimples((int) ($_GET['caixa'] ?? 0))])->enviar();
+
+            case 'unir_vaos':
+                ftth_exigir_csrf();
+                Cabo::unirVaos(
+                    (int) ($_POST['caixa'] ?? 0),
+                    isset($_POST['versao']) && $_POST['versao'] !== '' ? (int) $_POST['versao'] : null,
+                    $usuario_logado
+                )->enviar();
+
+            // Modo Selecionar: a área desenhada vira a lista de caixas e a prévia do que sai.
+            // Com `caixas`/`cabos` (ids), refaz a prévia de uma seleção ajustada à mão. `tipos`
+            // são as camadas visíveis: o que está escondido no mapa não entra na área; com
+            // `com_cabos`, o cabo que passa pela área entra inteiro.
+            case 'selecionar':
+                ftth_exigir_csrf();
+                $regiaoLote = (int) ($_POST['regiao'] ?? 0);
+                $cabosLote  = json_decode((string) ($_POST['cabos'] ?? '[]'), true);
+                if (isset($_POST['caixas'])) {
+                    $ids = json_decode((string) $_POST['caixas'], true);
+                    Resultado::ok(Lote::previa($regiaoLote, is_array($ids) ? $ids : [],
+                                               is_array($cabosLote) ? $cabosLote : []))->enviar();
+                }
+                $poligono = json_decode((string) ($_POST['poligono'] ?? '[]'), true);
+                $tiposLote = isset($_POST['tipos']) ? json_decode((string) $_POST['tipos'], true) : null;
+                Lote::selecionar($regiaoLote, is_array($poligono) ? $poligono : [],
+                                 isset($_POST['tipos']) ? (is_array($tiposLote) ? $tiposLote : []) : null,
+                                 ($_POST['com_cabos'] ?? '') === '1')->enviar();
+
+            case 'cor_lote':
+                ftth_exigir_csrf();
+                $ids = json_decode((string) ($_POST['caixas'] ?? '[]'), true);
+                $cabosLote = json_decode((string) ($_POST['cabos'] ?? '[]'), true);
+                Lote::pintar((int) ($_POST['regiao'] ?? 0), is_array($ids) ? $ids : [],
+                             (string) ($_POST['cor'] ?? ''), is_array($cabosLote) ? $cabosLote : [],
+                             (string) ($_POST['cor_cabo'] ?? ''), $usuario_logado)->enviar();
+
+            case 'excluir_lote':
+                ftth_exigir_csrf();
+                $ids = json_decode((string) ($_POST['caixas'] ?? '[]'), true);
+                $cabosLote = json_decode((string) ($_POST['cabos'] ?? '[]'), true);
+                Lote::excluir((int) ($_POST['regiao'] ?? 0), is_array($ids) ? $ids : [],
+                              (string) ($_POST['confirmacao'] ?? ''), $usuario_logado,
+                              is_array($cabosLote) ? $cabosLote : [])->enviar();
+
+            // Exportar KMZ (aba Ajustes e modo Selecionar). O contar responde JSON; o baixar
+            // responde o ARQUIVO — e JSON só quando falha, que é o que o JS confere.
+            case 'exportar_contar':
+                ftth_exigir_csrf();
+                Resultado::ok(KmzExport::contar(ftth_dados_exportacao()))->enviar();
+
+            case 'exportar_kmz':
+                ftth_exigir_csrf();
+                $dadosExp = ftth_dados_exportacao();
+                $titulo = count($dadosExp) > 1 ? 'todas as regiões'
+                        : (string) (reset($dadosExp)['nome'] ?? 'rede');
+                $rExp = KmzExport::exportar($dadosExp, $titulo);
+                if (!$rExp->ok) {
+                    $rExp->enviar();
+                }
+                while (ob_get_level() > 0) {
+                    ob_end_clean();
+                }
+                header('Content-Type: ' . $rExp->data['tipo_mime']);
+                header('Content-Disposition: attachment; filename="' . $rExp->data['nome'] . '"');
+                header('Content-Length: ' . strlen($rExp->data['conteudo']));
+                header('Cache-Control: no-store');
+                echo $rExp->data['conteudo'];
+                exit;
+
+            case 'excluir_caixa':
+                ftth_exigir_csrf();
+                if (($_POST['manter_cabos'] ?? '') === '1') {
+                    Caixa::excluirMantendoCabos(
+                        (int) ($_POST['id'] ?? 0),
+                        isset($_POST['versao']) ? (int) $_POST['versao'] : null,
+                        $usuario_logado
+                    )->enviar();
+                }
+                Caixa::excluir(
+                    (int) ($_POST['id'] ?? 0),
+                    isset($_POST['versao']) ? (int) $_POST['versao'] : null,
+                    $usuario_logado
+                )->enviar();
+
+            // ---------------------------------------------------------- clientes na porta
+            case 'atendimento':
+                $cx = (int) ($_GET['caixa'] ?? 0);
+                $d  = Topologia::atendimentoDaCaixa($cx);
+                if (!$d) {
+                    Resultado::erro('FTTH-TOP-001', ['caixa' => $cx])->enviar(404);
+                }
+                // A potência entra aqui, não no Topologia: quem junta as duas camadas é a
+                // tela, como já acontece no diagrama.
+                $sinal = Potencia::comSinal($cx);
+                foreach ($d['splitters'] as &$sp) {
+                    foreach ($sp['portas'] as &$pt) {
+                        $pt['dbm'] = $sinal['SPLITTER_OUT:' . $sp['id'] . ':' . $pt['numero']] ?? null;
+                    }
+                    unset($pt);
+                }
+                unset($sp);
+                Resultado::ok($d)->enviar();
+
+            // ------------------------------------------------------------- rota óptica
+            // O diagrama pede a rota de uma ponta escolhida no desenho; aqui o usuário
+            // clicou na caixa inteira. Quem escolhe a ponta representativa é o mesmo
+            // resumo que alimenta a ficha — assim o dBm do detalhe nunca discorda do
+            // dBm mostrado logo acima do botão.
+            case 'rota':
+                $cx     = (int) ($_GET['caixa'] ?? 0);
+                $resumo = Potencia::resumoDaCaixa($cx);
+                if (!$resumo) {
+                    Resultado::erro('FTTH-PWR-001', ['caixa' => $cx],
+                        'Esta caixa não tem caminho óptico até uma porta de DIO com equipamento.')
+                        ->enviar(404);
+                }
+                $r = Potencia::rota($cx, $resumo['ponta']['elemento'],
+                                    $resumo['ponta']['elemento_id'], $resumo['ponta']['numero']);
+                if (!$r->ok) {
+                    $r->enviar(404);
+                }
+                $rota           = $r->data;
+                $rota['onde']   = $resumo['onde'];
+                // Fora de uma saída de atendimento a faixa não se aplica (ela classifica o
+                // RX da ONU), e o resumo já resolveu isso — aqui só se obedece.
+                $rota['classe'] = $resumo['classe'];
+                Resultado::ok($rota)->enviar();
+
+            case 'buscar_cliente':
+                Resultado::ok(['clientes' => Topologia::buscarClientes(
+                    (string) ($_GET['q'] ?? ''))])->enviar();
+
+            case 'vincular_cliente':
+                ftth_exigir_csrf();
+                Topologia::vincularCliente(
+                    (int) ($_POST['cliente'] ?? 0),
+                    (int) ($_POST['splitter'] ?? 0),
+                    (int) ($_POST['numero'] ?? 0),
+                    $usuario_logado,
+                    ['mover' => ($_POST['mover'] ?? '') === '1']
+                )->enviar();
+
+            case 'desvincular_cliente':
+                ftth_exigir_csrf();
+                Topologia::desvincularCliente((int) ($_POST['cliente'] ?? 0), $usuario_logado)->enviar();
+
+            case 'sugerir_nome':
+                Resultado::ok(['nome' => Caixa::sugerirNome(
+                    (int) ($_GET['regiao'] ?? 0),
+                    (string) ($_GET['tipo'] ?? 'CTO'),
+                    ($_GET['base'] ?? '') !== '' ? (string) $_GET['base'] : null)])->enviar();
+
+            case 'importar_item':
+                ftth_exigir_csrf();
+                Quarentena::importarItem((int) ($_POST['id'] ?? 0), $usuario_logado)->enviar();
+
+            case 'descartar_item':
+                ftth_exigir_csrf();
+                Quarentena::descartar([(int) ($_POST['id'] ?? 0)], $usuario_logado, 'descartado no mapa')->enviar();
+
+            default:
+                Resultado::erro('FTTH-SYS-002')->enviar(400);
+        }
+    } catch (Throwable $e) {
+        Log::excecao('mapa.ajax', $e, ['ajax' => $_GET['ajax'] ?? '']);
+        Resultado::erro('FTTH-SYS-001')->enviar(500);
+    }
+}
+
+/* ------------------------------------------------------------------ página */
+$regioes   = [];
+$chave     = '';
+$aj        = ['google_maps_key' => '', 'mapa_tipo' => 'hybrid', 'mapa_rotulo_zoom' => 17,
+              'raio_quebra_cabo_m' => 10];
+$falha     = null;
+$passos    = null;
+$otdrEstimativa = null;
+$camadasUsuario = array_fill_keys(Ajustes::CAMADAS, true);   // se o banco falhar, tudo aparece
+try {
+    $regioes = Regiao::listar();
+    $chave   = (string) Config::get('google_maps_key', '');
+    $aj      = Ajustes::valores();
+    $passos  = PrimeirosPassos::estado();
+    $camadasUsuario = Ajustes::camadas($usuario_logado);
+} catch (Throwable $e) {
+    Log::excecao('mapa.carregar', $e);
+    $falha = 'Não foi possível carregar o mapa. FTTH-SYS-001 · ' . Resultado::requestId();
+}
+$regiaoSolicitada = (int) ($_GET['otdr_regiao'] ?? 0);
+$focoVao = null;
+$focoVaoId = filter_var($_GET['foco_vao'] ?? null, FILTER_VALIDATE_INT);
+if ($focoVaoId !== false && $focoVaoId > 0 && empty($_GET['otdr_vao'])) {
+    $caboFoco = Db::um(
+        'SELECT id, regiao_id, vertices FROM tab_ftth_cabo_vao WHERE id = ? AND excluido_em IS NULL',
+        [(int) $focoVaoId]);
+    if ($caboFoco) {
+        $pontosFoco = json_decode((string) $caboFoco['vertices'], true);
+        if (is_array($pontosFoco) && count($pontosFoco) >= 2) {
+            $latitudes = $longitudes = [];
+            foreach ($pontosFoco as $p) {
+                if (is_array($p) && count($p) >= 2 && is_numeric($p[0] ?? null) && is_numeric($p[1] ?? null)
+                    && (float) $p[0] >= -90 && (float) $p[0] <= 90
+                    && (float) $p[1] >= -180 && (float) $p[1] <= 180) {
+                    $latitudes[] = (float) $p[0];
+                    $longitudes[] = (float) $p[1];
+                }
+            }
+            if (count($latitudes) >= 2) {
+                $focoVao = ['id' => (int) $caboFoco['id'], 'regiao_id' => (int) $caboFoco['regiao_id'],
+                    'lat' => (min($latitudes) + max($latitudes)) / 2,
+                    'lng' => (min($longitudes) + max($longitudes)) / 2];
+                if (!$regiaoSolicitada) $regiaoSolicitada = (int) $caboFoco['regiao_id'];
+            }
+        }
+    }
+}
+$regiaoInicial = null;
+foreach ($regioes as $regiao) {
+    if ((int) $regiao['id'] === $regiaoSolicitada) {
+        $regiaoInicial = $regiao;
+        break;
+    }
+}
+$regiaoInicial = $regiaoInicial ?: ($regioes[0] ?? null);
+
+$latOtdr = filter_var($_GET['otdr_lat'] ?? null, FILTER_VALIDATE_FLOAT);
+$lngOtdr = filter_var($_GET['otdr_lng'] ?? null, FILTER_VALIDATE_FLOAT);
+$vaoOtdr = filter_var($_GET['otdr_vao'] ?? null, FILTER_VALIDATE_INT);
+$metrosOtdr = filter_var($_GET['otdr_metros'] ?? null, FILTER_VALIDATE_FLOAT);
+$bobinaOtdr = filter_var($_GET['otdr_bobina'] ?? 0, FILTER_VALIDATE_FLOAT);
+$margemOtdr = filter_var($_GET['otdr_margem'] ?? 0, FILTER_VALIDATE_FLOAT);
+$faixaOtdr = [];
+$faixaRaw = $_GET['otdr_faixa'] ?? '';
+if (is_string($faixaRaw) && strlen($faixaRaw) <= 30000) {
+    $candidatosFaixa = json_decode($faixaRaw, true);
+    if (is_array($candidatosFaixa) && count($candidatosFaixa) <= 101) {
+        $valida = true;
+        foreach ($candidatosFaixa as $p) {
+            if (!is_array($p) || count($p) !== 2 || !is_numeric($p[0] ?? null) || !is_numeric($p[1] ?? null)
+                || (float) $p[0] < -90 || (float) $p[0] > 90 || (float) $p[1] < -180 || (float) $p[1] > 180) {
+                $valida = false;
+                break;
+            }
+            $faixaOtdr[] = [(float) $p[0], (float) $p[1]];
+        }
+        if (!$valida) $faixaOtdr = [];
+    }
+}
+$regiaoOtdrValida = false;
+foreach ($regioes as $regiao) {
+    if ((int) $regiao['id'] === $regiaoSolicitada) {
+        $regiaoOtdrValida = true;
+        break;
+    }
+}
+if ($latOtdr !== false && $lngOtdr !== false && $vaoOtdr !== false && $metrosOtdr !== false
+    && $bobinaOtdr !== false && $margemOtdr !== false
+    && $vaoOtdr > 0 && $metrosOtdr >= 0 && $bobinaOtdr >= 0 && $bobinaOtdr <= 10000
+    && $metrosOtdr >= $bobinaOtdr && $margemOtdr >= 0 && $margemOtdr <= 1000 && $regiaoOtdrValida
+    && $latOtdr >= -90 && $latOtdr <= 90 && $lngOtdr >= -180 && $lngOtdr <= 180) {
+    $otdrEstimativa = [
+        'lat' => (float) $latOtdr,
+        'lng' => (float) $lngOtdr,
+        'vao_id' => (int) $vaoOtdr,
+        'regiao_id' => $regiaoSolicitada,
+        'metros' => (float) $metrosOtdr,
+        'bobina' => (float) $bobinaOtdr,
+        'corrigido' => (float) ($metrosOtdr - $bobinaOtdr),
+        'margem' => (float) $margemOtdr,
+        'faixa' => $faixaOtdr,
+    ];
+}
+
+$ftth_tela_cheia = true;   // o mapa ocupa a janela: sem barra de rolagem na página
+include('nav/header.php');
+?>
+<!-- ftth-mapa-full esconde o bloco de status do MK-AUTH (#systopo: logo, RAM/CPU, usuário)
+     SÓ nesta página, para o mapa ocupar a tela. O menu do topo continua intacto. -->
+<body class="ftth-mapa-full">
+<?php include('../../topo.php'); ?>
+
+<div class="ftth-wrap ftth-wrap--mapa">
+    <?php if ($falha): ?>
+        <div class="ftth-aviso ftth-aviso--erro"><?= htmlspecialchars($falha) ?></div>
+    <?php endif; ?>
+
+    <!-- Barra única: modos, região, busca, camadas, resumo e configurações numa linha só.
+         Cada elemento que sai daqui é altura que o mapa ganha, e o mapa é a tela.
+         Os ícones são os Bootstrap Icons que o próprio MK-AUTH já carrega (bi-icons.css):
+         nada de CDN nem de fonte nova só para o addon. -->
+    <div class="ftth-mapa-barra">
+        <div class="ftth-modos">
+            <button class="ftth-modo ativo" data-modo="navegar"><i class="bi-cursor-fill"></i> Navegar</button>
+            <button class="ftth-modo" data-modo="selecionar">
+                <i class="bi-bounding-box-circles"></i> Selecionar</button>
+            <button class="ftth-modo" data-modo="caixa">
+                <i class="bi-geo-alt-fill"></i> Ponto</button>
+            <button class="ftth-modo" data-modo="cabo">
+                <i class="bi-share-fill"></i> Cabo</button>
+            <button class="ftth-modo" data-modo="mover">
+                <i class="bi-arrows-move"></i> Mover</button>
+        </div>
+
+        <div class="ftth-busca">
+            <i class="bi-search ftth-busca-icone"></i>
+            <input id="busca" class="ftth-campo ftth-busca-campo" autocomplete="off"
+                   placeholder="Buscar ponto, cliente ou coordenada…">
+            <div id="busca-lista" class="ftth-busca-lista"></div>
+        </div>
+
+        <div class="ftth-barra-dir">
+            <!-- Enquanto a rede não tem o básico (chave, região, POP, caixa, cabo), a pílula
+                 reabre o assistente. Some sozinha quando os cinco passos existem no banco. -->
+            <button type="button" class="ftth-onb-pilula" id="onb-pilula" style="display:none">
+                <i class="bi-rocket-takeoff-fill"></i> Primeiros passos
+                <b id="onb-pilula-conta"></b></button>
+            <div class="ftth-resumo" id="resumo-mapa"></div>
+            <a class="ftth-btn ftth-btn--sec ftth-mapa-operacao" href="operacao.php" aria-label="Operação da rede" title="Operação da rede">
+                <i class="bi-activity"></i><span>Operação</span></a>
+            <button type="button" class="ftth-btn ftth-btn--sec" id="viabilidade-abrir"
+                    aria-expanded="false" aria-controls="viabilidade-painel">
+                <i class="bi-geo-alt"></i> Viabilidade</button>
+        </div>
+
+    </div>
+
+    <div class="ftth-mapa-area" id="mapa-area">
+        <div id="mapa"<?= $chave === '' ? ' class="ftth-mapa-vazio"' : '' ?>></div>
+
+        <section class="ftth-viab" id="viabilidade-painel" aria-labelledby="viab-titulo" hidden>
+            <div class="ftth-viab-topo">
+                <div><h2 id="viab-titulo">Consulta de cobertura</h2>
+                    <p>Veja CTOs próximas ao endereço candidato.</p></div>
+                <button type="button" class="ftth-painel-fechar" id="viabilidade-fechar" aria-label="Fechar">&times;</button>
+            </div>
+            <label class="ftth-rotulo-campo" for="viab-endereco">Endereço do futuro cliente</label>
+            <div class="ftth-viab-linha">
+                <input class="ftth-campo" id="viab-endereco" maxlength="180"
+                       placeholder="Rua, número, bairro e cidade" autocomplete="street-address">
+                <button type="button" class="ftth-btn ftth-btn--pri" id="viab-buscar-endereco">Buscar</button>
+            </div>
+            <div id="viab-enderecos" class="ftth-viab-enderecos" aria-live="polite"></div>
+            <div class="ftth-viab-separador">ou use coordenadas</div>
+            <div class="ftth-viab-linha">
+                <input class="ftth-campo" id="viab-coordenadas" placeholder="-25.4412, -49.2768"
+                       inputmode="decimal" aria-label="Latitude e longitude">
+                <button type="button" class="ftth-btn ftth-btn--sec" id="viab-usar-coordenadas">Usar</button>
+            </div>
+            <div class="ftth-viab-controles">
+                <label class="ftth-rotulo-campo" for="viab-raio">Raio de busca</label>
+                <div class="ftth-viab-linha">
+                    <input class="ftth-campo" id="viab-raio" type="number" min="100" max="5000" step="50"
+                           value="<?= (int) Config::num('raio_busca_comercial_m', 300) ?>">
+                    <span>metros</span>
+                    <button type="button" class="ftth-btn ftth-btn--sec" id="viab-escolher-mapa">
+                        <i class="bi-crosshair"></i> Marcar no mapa</button>
+                </div>
+            </div>
+            <p class="ftth-viab-nota">Distância em linha reta; a viabilidade final depende de vistoria e rota de drop.</p>
+            <div id="viab-status" class="ftth-viab-status" role="status" aria-live="polite">Informe um endereço ou ponto.</div>
+            <div id="viab-resultados" class="ftth-viab-resultados"></div>
+        </section>
+
+        <!-- Primeiros passos (js/onboarding.js). Card centralizado nos passos de ler e decidir;
+             nos que exigem mexer no mapa ele sai da frente e fica só o balão de baixo. O passo
+             em que a pessoa está vem do banco (PrimeirosPassos), nunca de uma marca gravada. -->
+        <div id="onb" class="ftth-onb" style="display:none">
+            <div class="ftth-onb-card" role="dialog" aria-labelledby="onb-titulo">
+                <button type="button" class="ftth-painel-fechar" id="onb-fechar" title="Pular por agora">&times;</button>
+                <div class="ftth-onb-topo">
+                    <span class="ftth-onb-selo">Primeiros passos</span>
+                    <ol class="ftth-onb-trilha" id="onb-trilha">
+                        <li data-passo="chave"><span>1</span>Chave</li>
+                        <li data-passo="regiao"><span>2</span>Região</li>
+                        <li data-passo="pop"><span>3</span>POP</li>
+                        <li data-passo="caixa"><span>4</span>Caixa</li>
+                        <li data-passo="cabo"><span>5</span>Cabo</li>
+                    </ol>
+                </div>
+
+                <section class="ftth-onb-passo" data-passo="chave">
+                    <h2 id="onb-titulo"><i class="bi-key-fill"></i>
+                        <span id="onb-chave-titulo">Bem-vindo ao FTTH Doc</span></h2>
+                    <p id="onb-chave-texto">Em cinco passos a sua rede começa a aparecer no mapa. O
+                        primeiro é a chave do Google Maps, que é quem desenha o mapa.</p>
+                    <div id="onb-chave-erro" class="ftth-aviso ftth-aviso--erro" style="display:none"></div>
+                    <label class="ftth-rotulo-campo" for="onb-chave">Chave do Google Maps</label>
+                    <div class="ftth-onb-linha">
+                        <input id="onb-chave" class="ftth-campo" autocomplete="off" spellcheck="false">
+                        <button type="button" class="ftth-btn ftth-btn--pri" id="onb-chave-salvar">
+                            <i class="bi-check-circle-fill"></i> Salvar</button>
+                    </div>
+                    <div id="onb-chave-saida"></div>
+                    <details class="ftth-onb-ajuda" id="onb-chave-ajuda">
+                        <summary>Não tenho a chave. Como consigo?</summary>
+                        <ol>
+                            <li>No <a href="https://console.cloud.google.com/google/maps-apis" target="_blank"
+                                      rel="noopener">console do Google Cloud</a>, ative a
+                                <strong>Maps JavaScript API</strong>. O Google pede uma conta de
+                                faturamento ativa no projeto.</li>
+                            <li>Em <strong>Credenciais</strong>, crie uma <strong>chave de API</strong>.</li>
+                            <li>Na chave, em <em>Restrições do aplicativo</em>, escolha
+                                <strong>Sites</strong> e adicione este endereço:
+                                <span class="ftth-onb-copiar">
+                                    <code id="onb-host"><?= htmlspecialchars(($_SERVER['HTTP_HOST'] ?? 'seu-servidor')) ?>/*</code>
+                                    <button type="button" class="ftth-btn ftth-btn--sec" id="onb-host-copiar">
+                                        <i class="bi-clipboard"></i> Copiar</button>
+                                </span>
+                                Sem ele o Google recusa a chave e o mapa abre cinza.</li>
+                            <li>Copie a chave, cole acima e salve.</li>
+                        </ol>
+                    </details>
+                    <p class="ftth-sub ftth-onb-nota">A chave fica guardada no seu servidor. Nenhum dado da
+                        sua rede sai dele: fora o próprio mapa, o addon só consulta o GitHub quando
+                        você pede para verificar atualização.</p>
+                </section>
+
+                <section class="ftth-onb-passo" data-passo="regiao">
+                    <h2><i class="bi-map"></i> Onde fica a sua rede?</h2>
+                    <p>A região é a área que você vai documentar: uma cidade, um distrito, um bairro.
+                        Dê um nome e, em seguida, leve o mapa até lá.</p>
+                    <label class="ftth-rotulo-campo" for="onb-regiao">Nome da região</label>
+                    <div class="ftth-onb-linha">
+                        <input id="onb-regiao" class="ftth-campo" maxlength="80" autocomplete="off">
+                        <button type="button" class="ftth-btn ftth-btn--pri" id="onb-regiao-seguir">
+                            Continuar <i class="bi-arrow-right"></i></button>
+                    </div>
+                    <div id="onb-regiao-saida"></div>
+                </section>
+
+                <section class="ftth-onb-passo" data-passo="pop">
+                    <h2><i class="bi-hdd-rack-fill"></i> Marque o seu POP</h2>
+                    <div class="ftth-onb-cadeia" data-foco="pop"></div>
+                    <p>O POP (ou Data Center) é onde ficam a OLT e o DIO. É dele que as fibras saem
+                        para a rua, por isso toda a rede começa nele.</p>
+                    <button type="button" class="ftth-btn ftth-btn--pri ftth-onb-acao" data-acao="pop">
+                        <i class="bi-geo-alt-fill"></i> Marcar o POP no mapa</button>
+                </section>
+
+                <section class="ftth-onb-passo" data-passo="caixa">
+                    <h2><i class="bi-box-seam"></i> Agora, a primeira caixa na rua</h2>
+                    <div class="ftth-onb-cadeia" data-foco="caixa"></div>
+                    <p>O cabo que sai do <strong class="js-onb-pop"></strong> precisa chegar a algum
+                        lugar. Marque a primeira caixa da rede: normalmente uma <strong>CEO</strong>;
+                        se o seu POP sai direto numa <strong>CTO</strong>, pode ser ela.</p>
+                    <button type="button" class="ftth-btn ftth-btn--pri ftth-onb-acao" data-acao="caixa">
+                        <i class="bi-geo-alt-fill"></i> Marcar a caixa no mapa</button>
+                </section>
+
+                <section class="ftth-onb-passo" data-passo="cabo">
+                    <h2><i class="bi-share-fill"></i> Ligue o POP à caixa</h2>
+                    <div class="ftth-onb-cadeia" data-foco="cabo"></div>
+                    <!-- O passo só conta quando o cabo LIGA o POP à caixa (PrimeirosPassos). Cabo que
+                         parou numa ponta livre mostra o segundo texto, com o jeito de terminar. -->
+                    <p class="js-onb-cabo-novo">O cabo já vai começar no
+                        <strong class="js-onb-pop"></strong>: siga a rua clicando no mapa e termine
+                        clicando em <strong class="js-onb-caixa"></strong>. Se parar antes, a ponta
+                        fica livre e você continua depois.</p>
+                    <p class="js-onb-cabo-solto" style="display:none">O cabo ainda não chega em
+                        <strong class="js-onb-caixa"></strong>: ele parou numa ponta livre. Clique na
+                        ponta e use <strong>Continuar cabo</strong>, ou, no modo <strong>Mover</strong>,
+                        arraste a ponta até <strong class="js-onb-caixa"></strong> e escolha
+                        <strong>Ancorar</strong>. Também dá para desenhar um cabo novo do POP até ela.</p>
+                    <button type="button" class="ftth-btn ftth-btn--pri ftth-onb-acao" data-acao="cabo">
+                        <i class="bi-share-fill"></i> Desenhar o cabo</button>
+                </section>
+
+                <section class="ftth-onb-passo" data-passo="fim">
+                    <h2><i class="bi-check-circle-fill ftth-onb-ok"></i> Sua rede começou!</h2>
+                    <div class="ftth-onb-cadeia" data-foco="fim"></div>
+                    <p>POP, caixa e cabo estão no mapa. Daqui em diante é repetir: marcar as caixas e
+                        ligar os cabos entre elas. Dois próximos passos, quando quiser:</p>
+                    <div class="ftth-onb-proximos">
+                        <a class="ftth-onb-proximo" id="onb-link-pop" href="#">
+                            <i class="bi-hdd-rack-fill"></i>
+                            <strong>Configurar o POP</strong>
+                            <span>Cadastre a OLT e o DIO: é deles que sai o sinal da rede.</span></a>
+                        <a class="ftth-onb-proximo" id="onb-link-caixa" href="#">
+                            <i class="bi-diagram-3-fill"></i>
+                            <strong>Abrir o diagrama da <span class="js-onb-caixa"></span></strong>
+                            <span>Ligue as fibras que chegam: fusão, passagem e splitter.</span></a>
+                    </div>
+                </section>
+
+                <div class="ftth-onb-rodape">
+                    <button type="button" class="ftth-onb-link" id="onb-pular">Pular por agora</button>
+                    <span class="ftth-onb-contagem" id="onb-contagem"></span>
+                    <button type="button" class="ftth-btn ftth-btn--pri" id="onb-concluir" style="display:none">
+                        Continuar no mapa</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Balão dos passos que se fazem no mapa: fica fixo, não some como um toast. -->
+        <div id="onb-balao" class="ftth-onb-balao" style="display:none">
+            <span class="ftth-onb-balao-num" id="onb-balao-num"></span>
+            <div class="ftth-onb-balao-texto">
+                <strong id="onb-balao-titulo"></strong>
+                <span id="onb-balao-texto"></span>
+            </div>
+            <button type="button" class="ftth-onb-link" id="onb-balao-voltar">Voltar</button>
+        </div>
+
+        <!-- Painel lateral (padrão UpperX): regiões e camadas hoje; pontos e o que vier
+             depois ganham aba aqui, em vez de mais botão na barra. Abre por cima do mapa. -->
+        <button type="button" class="ftth-gaveta-aba" id="gaveta-aba" title="Painel">
+            <i class="bi-chevron-right"></i></button>
+        <aside class="ftth-gaveta" id="gaveta">
+            <nav class="ftth-gaveta-abas">
+                <button type="button" class="ftth-gaveta-tab ativo" data-aba="regioes">
+                    <i class="bi-map"></i><span>Regiões</span></button>
+                <button type="button" class="ftth-gaveta-tab" data-aba="clientes">
+                    <i class="bi-people"></i><span>Clientes <b id="clientes-sem-localizacao-conta"></b></span></button>
+                <button type="button" class="ftth-gaveta-tab" data-aba="pontos">
+                    <i class="bi-geo-alt"></i><span>Pontos <b id="pontos-filtro" class="ftth-gaveta-filtro"
+                        style="display:none"></b></span></button>
+                <button type="button" class="ftth-gaveta-tab" data-aba="camadas">
+                    <i class="bi-layers"></i><span>Camadas <b id="camadas-conta">5</b></span></button>
+                <button type="button" class="ftth-gaveta-tab" data-aba="ajustes">
+                    <i class="bi-gear"></i><span>Ajustes</span></button>
+            </nav>
+
+            <section class="ftth-gaveta-corpo" data-aba="regioes">
+                <div class="ftth-gaveta-lista" id="lista-regioes"></div>
+                <div class="ftth-gaveta-rodape">
+                    <button type="button" class="ftth-btn ftth-btn--pri ftth-gaveta-acao" id="regiao-nova">
+                        <i class="bi-plus-circle-fill"></i> Nova região</button>
+                </div>
+            </section>
+
+            <section class="ftth-gaveta-corpo" data-aba="clientes" style="display:none">
+                <div class="ftth-gaveta-topo">
+                    <strong>Clientes sem localização</strong>
+                    <p class="ftth-sub">Cadastros ativos sem coordenada reconhecida e sem ponto adicional.</p>
+                    <div class="ftth-busca ftth-gaveta-busca">
+                        <i class="bi-search ftth-busca-icone"></i>
+                        <input id="clientes-sem-localizacao-busca" class="ftth-campo ftth-busca-campo"
+                               autocomplete="off" placeholder="Buscar por nome ou login…">
+                    </div>
+                </div>
+                <div class="ftth-gaveta-lista" id="lista-clientes-sem-localizacao"></div>
+                <div class="ftth-gaveta-rodape">
+                    <button type="button" class="ftth-btn ftth-btn--sec ftth-gaveta-acao"
+                            id="clientes-sem-localizacao-mais" style="display:none">Carregar mais</button>
+                </div>
+            </section>
+
+            <!-- Lista da região inteira, não só da área visível. O filtro vale também no mapa:
+                 o que não atende fica translúcido, para não se perder a noção de onde se está. -->
+            <section class="ftth-gaveta-corpo" data-aba="pontos" style="display:none">
+                <div class="ftth-gaveta-topo">
+                    <div class="ftth-busca ftth-gaveta-busca">
+                        <i class="bi-search ftth-busca-icone"></i>
+                        <input id="pontos-busca" class="ftth-campo ftth-busca-campo" autocomplete="off"
+                               placeholder="Buscar ponto pelo nome…">
+                    </div>
+                    <div class="ftth-filtros" id="pontos-filtros">
+                        <button type="button" class="ftth-filtro ativo" data-filtro="todos">Todos</button>
+                        <button type="button" class="ftth-filtro" data-filtro="sem_sinal"
+                                title="CTO e CEO sem caminho óptico até uma porta de DIO com equipamento">
+                            Sem sinal <b id="conta-sem-sinal"></b></button>
+                        <button type="button" class="ftth-filtro" data-filtro="sem_splitter"
+                                title="CTO e CEO sem nenhum splitter, de atendimento ou de derivação">
+                            Sem splitter <b id="conta-sem-splitter"></b></button>
+                        <button type="button" class="ftth-filtro" data-filtro="postes"
+                                title="Só os postes da região">
+                            Postes <b id="conta-postes"></b></button>
+                    </div>
+                </div>
+                <div class="ftth-gaveta-lista" id="lista-pontos"></div>
+            </section>
+
+            <section class="ftth-gaveta-corpo" data-aba="camadas" style="display:none">
+                <div class="ftth-gaveta-lista">
+                    <p class="ftth-gaveta-secao ftth-gaveta-secao--acao">Mostrar no mapa
+                        <button type="button" id="cam-todas">Marcar todos</button></p>
+                    <?php
+                    // Por usuário e gravadas no banco (Ajustes::camadas): desmarcar aqui vale até
+                    // o usuário marcar de novo, mesmo depois de logoff ou em outro computador.
+                    $rotulosCamadas = [
+                        'CTO' => ['CTO', ''], 'CEO' => ['CEO', ''], 'DC' => ['DC / POP', ''],
+                        'PREDIO' => ['Prédio', ''], 'PROBLEMA' => ['Problema', ''],
+                        'RESERVA' => ['Reserva', ''], 'CLIENTES' => ['Clientes', 'clientes e instalações na área visível'],
+                        'POSTES' => ['Postes', ''], 'CABOS' => ['Cabos', ''],
+                        'QUARENTENA' => ['Quarentena', 'itens importados ainda não revisados'],
+                        'ROTULOS' => ['Nomes de ruas', 'nomes de vias do mapa do Google'],
+                    ];
+                    foreach ($rotulosCamadas as $cam => [$rotulo, $nota]): ?>
+                        <label class="ftth-gaveta-opcao"><input type="checkbox" class="cam" value="<?= $cam ?>"
+                            <?= !empty($camadasUsuario[$cam]) ? 'checked' : '' ?>> <?= htmlspecialchars($rotulo) ?>
+                            <?php if ($nota !== ''): ?><small><?= htmlspecialchars($nota) ?></small><?php endif; ?></label>
+                    <?php endforeach; ?>
+                    <div class="ftth-legenda-clientes" aria-label="Legenda dos marcadores">
+                        <strong>Identificação no mapa</strong>
+                        <span><i class="ftth-legenda-ponto normal"></i> Cliente normal</span>
+                        <span><i class="ftth-legenda-ponto adicional"></i> Cliente adicional</span>
+                        <span><i class="ftth-legenda-ponto bloqueado"></i> Cliente bloqueado</span>
+                        <span><i class="ftth-legenda-ponto cto"></i> CTO</span>
+                        <small>O ponto no ícone normal indica o vínculo FTTH: verde quando já está vinculado e laranja quando não está.</small>
+                    </div>
+                </div>
+            </section>
+            <!-- Ajustes: valem para todos os usuários do painel. O estado do banco só é lido
+                 quando a aba abre. -->
+            <section class="ftth-gaveta-corpo" data-aba="ajustes" style="display:none">
+                <div class="ftth-gaveta-lista">
+                    <p class="ftth-gaveta-secao">Ajustes do mapa</p>
+                    <div class="ftth-ajustes">
+                        <label class="ftth-rotulo-campo" for="aj-chave">Chave do Google Maps</label>
+                        <input id="aj-chave" class="ftth-campo" autocomplete="off" spellcheck="false"
+                               placeholder="AIza..." value="<?= htmlspecialchars($aj['google_maps_key']) ?>">
+
+                        <!-- O raio de emenda (raio_quebra_cabo_m) saiu da tela em 25/09/2026: fica
+                             no padrão de 10 m, que o servidor continua lendo de tab_ftth_config. -->
+                        <div class="ftth-ajustes-par">
+                            <div>
+                                <label class="ftth-rotulo-campo" for="aj-tipo">Tipo de mapa</label>
+                                <select id="aj-tipo" class="ftth-campo">
+                                    <?php foreach (Ajustes::TIPOS_MAPA as $v => $r): ?>
+                                        <option value="<?= $v ?>" <?= $aj['mapa_tipo'] === $v ? 'selected' : '' ?>><?= $r ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="ftth-rotulo-campo" for="aj-zoom">Zoom do rótulo</label>
+                                <input id="aj-zoom" class="ftth-campo" type="number" min="3" max="21"
+                                       value="<?= (int) $aj['mapa_rotulo_zoom'] ?>">
+                            </div>
+                        </div>
+
+                        <button type="button" class="ftth-btn ftth-btn--pri ftth-gaveta-acao" id="aj-salvar">
+                            <i class="bi-check-circle-fill"></i> Salvar</button>
+                        <div id="aj-saida"></div>
+                    </div>
+
+                    <p class="ftth-gaveta-secao" style="margin-top:16px">Dados</p>
+                    <a class="ftth-btn ftth-btn--sec ftth-gaveta-acao" href="importar.php">
+                        <i class="bi-box-seam"></i> Importar KMZ</a>
+                    <button type="button" class="ftth-btn ftth-btn--sec ftth-gaveta-acao" id="exp-abrir">
+                        <i class="bi-download"></i> Exportar KMZ</button>
+                    <button type="button" class="ftth-btn ftth-btn--sec ftth-gaveta-acao" id="onb-rever">
+                        <i class="bi-signpost-2-fill"></i> Rever os primeiros passos</button>
+                </div>
+
+                <div class="ftth-gaveta-rodape ftth-estado" id="estado-banco">
+                    <p class="ftth-gaveta-vazio" style="padding:0">Lendo o estado do banco…</p>
+                </div>
+                <!-- Fora do #estado-banco, que o JS reescreve a cada leitura. -->
+                <div class="ftth-gaveta-rodape ftth-autor">
+                    <span>By <strong>Marcelo Silvestro</strong></span>
+                    <a href="https://wa.me/5542984277951" target="_blank" rel="noopener"
+                       title="Falar no WhatsApp" aria-label="WhatsApp"><i class="bi-whatsapp"></i></a>
+                </div>
+            </section>
+        </aside>
+
+        <!-- Nova região, passo 2: o centro é a vista do mapa, então o usuário leva o mapa até
+             lá antes de gravar. Assim a região nunca nasce no lugar errado sem ninguém ver. -->
+        <div id="regiao-card" class="ftth-flutuante" style="display:none">
+            <div class="ftth-flutuante-info">
+                <strong><i class="bi-map"></i> Nova região</strong>
+                <span id="regiao-card-nome"></span>
+                <span class="ftth-flutuante-dica">Posicione o mapa onde fica a região e confirme.</span>
+            </div>
+            <button class="ftth-btn ftth-btn--sec" id="regiao-card-cancelar">
+                <i class="bi-x-octagon-fill"></i> Cancelar</button>
+            <button class="ftth-btn ftth-btn--pri" id="regiao-card-confirmar">
+                <i class="bi-check-circle-fill"></i> Confirmar</button>
+        </div>
+        <div id="painel" class="ftth-painel" style="display:none">
+            <button class="ftth-painel-fechar" id="painel-fechar">&times;</button>
+            <div id="painel-conteudo"></div>
+        </div>
+
+        <!-- Card flutuante do traçado (padrão UpperX): contagem de pontos e ações. -->
+        <div id="cabo-card" class="ftth-flutuante" style="display:none">
+            <div class="ftth-flutuante-info">
+                <strong><i class="bi-share-fill"></i> <span id="cabo-titulo">Traçando cabo</span></strong>
+                <span id="cabo-contagem">0 pontos</span>
+                <!-- O próximo passo muda a cada clique: toast a cada um seria martelar o
+                     usuário. Fica aqui, onde o olho já está enquanto ele desenha. -->
+                <span id="cabo-dica" class="ftth-flutuante-dica"></span>
+            </div>
+            <!-- Reabre a configuração sem perder o que já foi desenhado. -->
+            <button type="button" class="ftth-flutuante-icone" id="cabo-config" title="Configuração do cabo">
+                <i class="bi-sliders"></i></button>
+            <button class="ftth-btn ftth-btn--sec" id="cabo-cancelar" title="Descartar o traçado e sair do modo Cabo">
+                <i class="bi-x-octagon-fill"></i> Cancelar</button>
+            <button class="ftth-btn ftth-btn--sec" id="cabo-desfazer">
+                <i class="bi-arrow-counterclockwise"></i> Desfazer</button>
+            <button class="ftth-btn ftth-btn--pri" id="cabo-finalizar">
+                <i class="bi-check-circle-fill"></i> Finalizar</button>
+        </div>
+
+        <!-- Editor de rota: aparece somente quando um cabo é selecionado no modo Mover. -->
+        <aside id="ftth-painel-rota" class="ftth-painel-rota" aria-label="Edição da rota do cabo">
+            <header class="ftth-painel-rota-cabecalho">
+                <span class="ftth-painel-rota-sobretitulo"><i class="bi-bezier2"></i> Rota do cabo</span>
+                <h2 id="ftth-rota-titulo">Selecione um cabo</h2>
+                <button type="button" id="ftth-rota-fechar" class="ftth-rota-fechar"
+                        title="Fechar o editor sem descartar as alterações" aria-label="Fechar editor da rota">
+                    <i class="bi-x-lg"></i></button>
+            </header>
+            <div class="ftth-painel-rota-comprimento">
+                <span><i class="bi-rulers"></i> Comprimento aproximado</span>
+                <strong id="ftth-rota-comprimento">—</strong>
+            </div>
+            <section id="ftth-rota-extremos" class="ftth-rota-extremos" aria-label="Pontas do cabo">
+                <h3><i class="bi-link-45deg"></i> Pontas do cabo</h3>
+                <div id="ftth-rota-extremos-lista"></div>
+                <p>Soltar grava imediatamente e pode remover fusões de fibra na caixa de origem.</p>
+            </section>
+            <p id="ftth-rota-vazia" class="ftth-rota-vazio" style="display:none"></p>
+            <ol id="ftth-rota-pontos" class="ftth-rota-pontos"></ol>
+        </aside>
+
+        <!-- Card do modo Mover. Nada aqui vai para o banco antes do Concluir: o usuário
+             arrasta à vontade e só então assume. Sair do modo com pendência pergunta. -->
+        <div id="mover-card" class="ftth-flutuante ftth-flutuante--edicao" style="display:none">
+            <div class="ftth-flutuante-info">
+                <strong><i class="bi-arrows-move"></i> Modo edição</strong>
+                <span id="mover-dica" class="ftth-flutuante-dica">
+                    Arraste um ponto. Clique num cabo para editar o traçado.</span>
+                <span id="mover-ponta-status" class="ftth-flutuante-dica" style="display:none"></span>
+                <span id="mover-vinculo-status" class="ftth-flutuante-dica" style="display:none"></span>
+            </div>
+            <span class="ftth-flutuante-conta" id="mover-conta">nada alterado</span>
+            <!-- Só em tela estreita: a dica longa sai do card e fica a um toque. -->
+            <button type="button" class="ftth-flutuante-ajuda" id="mover-ajuda" title="Como editar">
+                <i class="bi-question-circle"></i></button>
+            <button class="ftth-btn ftth-btn--perigo" id="mover-ponta-soltar" type="button"
+                    title="Soltar a ponta selecionada e deixá-la livre no mesmo local" style="display:none">
+                <i class="bi-unlink"></i> Soltar ponta</button>
+            <button class="ftth-btn ftth-btn--sec" id="mover-vinculo-abrir" type="button"
+                    title="Conectar uma CTO ou outro ponto existente no meio deste cabo" style="display:none">
+                <i class="bi-link-45deg"></i> Vincular ponto no trecho</button>
+            <button class="ftth-btn ftth-btn--sec" id="mover-vinculo-cancelar" type="button"
+                    title="Cancelar a escolha de ponto para vincular no meio do cabo" style="display:none">
+                <i class="bi-x-circle"></i> Cancelar vínculo</button>
+            <button class="ftth-btn ftth-btn--sec" id="mover-descartar"
+                    title="Descartar as alterações e sair do modo edição">
+                <i class="bi-x-octagon-fill"></i> Cancelar</button>
+            <button class="ftth-btn ftth-btn--pri" id="mover-concluir" disabled>
+                <i class="bi-check-circle-fill"></i> Concluir</button>
+        </div>
+
+        <!-- Modo Selecionar, passo 1: cada clique é um vértice da área (padrão UpperX). -->
+        <div id="sel-card" class="ftth-flutuante" style="display:none">
+            <div class="ftth-flutuante-info">
+                <strong><i class="bi-bounding-box-circles"></i> Selecionar</strong>
+                <span id="sel-conta">0 pontos</span>
+                <span id="sel-dica" class="ftth-flutuante-dica"></span>
+                <span class="ftth-flutuante-dica ftth-sel-filtro"></span>
+            </div>
+            <button class="ftth-btn ftth-btn--sec" id="sel-cancelar" title="Sair do modo Selecionar">
+                <i class="bi-x-octagon-fill"></i> Cancelar</button>
+            <button class="ftth-btn ftth-btn--sec" id="sel-desfazer" disabled>
+                <i class="bi-arrow-counterclockwise"></i> Desfazer</button>
+            <button class="ftth-btn ftth-btn--pri" id="sel-concluir" disabled>
+                <i class="bi-check-circle-fill"></i> Concluir área</button>
+        </div>
+
+        <!-- Passo 2: o que ficou dentro da área, e as ações sobre isso. -->
+        <div id="sel-barra" class="ftth-flutuante ftth-lote-barra" style="display:none">
+            <div class="ftth-flutuante-info">
+                <strong>Itens selecionados</strong>
+                <span class="ftth-lote-contas">
+                    <span title="Pontos"><i class="bi-geo-alt-fill"></i> <b id="sel-n-caixas">0</b></span>
+                    <span title="Cabos afetados"><i class="bi-share-fill"></i> <b id="sel-n-cabos">0</b></span>
+                </span>
+                <span class="ftth-flutuante-dica">Clique num ponto ou cabo para tirar ou pôr na seleção.</span>
+                <span class="ftth-flutuante-dica ftth-sel-filtro"></span>
+            </div>
+            <button class="ftth-btn ftth-btn--sec" id="sel-nova" title="Descartar a seleção e desenhar outra área">
+                <i class="bi-bounding-box"></i> Nova área</button>
+            <button class="ftth-btn ftth-btn--sec" id="sel-cor" title="Mudar a cor dos pontos selecionados">
+                <i class="bi-palette-fill"></i> Cor</button>
+            <button class="ftth-btn ftth-btn--sec" id="sel-exportar" title="Baixar a seleção em KMZ">
+                <i class="bi-download"></i> Exportar</button>
+            <button class="ftth-btn ftth-btn--perigo" id="sel-excluir">
+                <i class="bi-trash3-fill"></i> Excluir</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal de lançar cabo: abre DEPOIS do traçado, como no UpperX -->
+<!-- Modo Cabo, passo 1: configura aqui, depois desenha no mapa (desde 24/09/2026; antes era
+     o inverso). O Finalizar do traçado grava direto com o que está neste popup. -->
+<div id="modal-cabo" class="ftth-modal" style="display:none">
+    <div class="ftth-modal-caixa">
+        <div class="ftth-modal-topo">
+            <strong><i class="bi-share-fill"></i> <span id="cabo-modal-titulo">Novo cabo</span></strong>
+            <button class="ftth-painel-fechar" id="cabo-modal-fechar">&times;</button>
+        </div>
+        <div class="ftth-modal-corpo">
+            <p class="ftth-sub" id="cabo-resumo"></p>
+
+            <label class="ftth-rotulo-campo">Nome do cabo (opcional)</label>
+            <input id="cb-nome" class="ftth-campo" style="width:100%" maxlength="80">
+
+            <label class="ftth-rotulo-campo">Fabricante (opcional)</label>
+            <input id="cb-fabricante" class="ftth-campo" style="width:100%" maxlength="60">
+
+            <div class="row g-3">
+                <div class="col-7">
+                    <label class="ftth-rotulo-campo">Capacidade (fibras)</label>
+                    <select id="cb-tipo" class="ftth-campo" style="width:100%">
+                        <?php foreach (Cabo::tipos() as $t): ?>
+                            <option value="<?= (int) $t['id'] ?>" <?= $t['rotulo'] === '6 FO' ? 'selected' : '' ?>>
+                                <?= htmlspecialchars($t['rotulo']) ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="col-5">
+                    <label class="ftth-rotulo-campo">Padrão de cores</label>
+                    <select id="cb-padrao" class="ftth-campo" style="width:100%">
+                        <?php foreach (Cabo::PADROES_COR as $p): ?>
+                            <option value="<?= $p ?>"><?= $p ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+            </div>
+
+            <label class="ftth-rotulo-campo">Cor da rota</label>
+            <div class="ftth-cores" id="cb-cores">
+                <?php foreach (['#00E676', '#00BCD4', '#0D47A1', '#FF9100', '#E53935',
+                                '#8E24AA', '#FDD835', '#212121', '#9E9E9E'] as $i => $cor): ?>
+                    <button type="button" class="ftth-cor<?= $i === 0 ? ' ativo' : '' ?>"
+                            data-cor="<?= $cor ?>" style="background:<?= $cor ?>"></button>
+                <?php endforeach; ?>
+            </div>
+
+            <div id="cb-espessura-area">
+                <label class="ftth-rotulo-campo">Espessura da rota no mapa</label>
+                <select id="cb-espessura" class="ftth-campo" style="width:100%">
+                    <option value="">Padrão do mapa (<?= (int) Config::num('mapa_cabo_espessura', 5) ?> px)</option>
+                    <?php for ($px = 1; $px <= 12; $px++): ?>
+                        <option value="<?= $px ?>"><?= $px ?> px</option>
+                    <?php endfor; ?>
+                </select>
+                <small class="ftth-sub">A largura escolhida vale para todos os trechos deste cabo.</small>
+            </div>
+            <p id="cb-espessura-continuacao" class="ftth-sub" style="display:none">
+                A continuação mantém a espessura já cadastrada nesse cabo.
+            </p>
+
+            <div id="cb-saida"></div>
+        </div>
+        <div class="ftth-modal-rodape">
+            <button class="ftth-btn ftth-btn--sec" id="cb-cancelar">Cancelar</button>
+            <button class="ftth-btn ftth-btn--pri" id="cb-salvar">Desenhar</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal de nova caixa (padrão UpperX: nome, tipo, cor e "Ancorar no Mapa") -->
+<div id="modal-caixa" class="ftth-modal" style="display:none">
+    <div class="ftth-modal-caixa">
+        <div class="ftth-modal-topo">
+            <strong><i class="bi-geo-alt-fill"></i> <span id="modal-titulo">Novo ponto</span></strong>
+            <button class="ftth-painel-fechar" id="modal-fechar">&times;</button>
+        </div>
+        <div class="ftth-modal-corpo">
+            <p class="ftth-sub" id="nc-ponto" style="margin:0 0 4px"></p>
+
+            <label class="ftth-rotulo-campo">Nome do ponto</label>
+            <input id="nc-nome" class="ftth-campo" style="width:100%" maxlength="80">
+            <!-- Junto do nome porque é sobre ele: o próximo ponto nasce com o número seguinte.
+                 Só CTO, CEO e Reserva, que se lançam em sequência pela rua. -->
+            <label class="ftth-chk" id="nc-sequencia-area" style="display:block;margin-top:6px">
+                <input type="checkbox" id="nc-sequencia"> continuar adicionando (numera sozinho)
+            </label>
+
+            <label class="ftth-rotulo-campo">Tipo de ponto</label>
+            <div class="ftth-tipos">
+                <?php foreach (Caixa::ROTULOS as $valor => $rotulo): ?>
+                    <button type="button" class="ftth-tipo<?= $valor === 'CTO' ? ' ativo' : '' ?>"
+                            data-tipo="<?= $valor ?>">
+                        <?php // CTO e CEO mostram a silhueta da peça; o resto, o ícone do painel. ?>
+                        <?php if ($svg = Caixa::silhueta($valor, '#4A5568', 22)): ?>
+                            <?= $svg ?>
+                        <?php else: ?>
+                            <i class="<?= Caixa::icone($valor) ?>"></i>
+                        <?php endif; ?>
+                        <span><?= htmlspecialchars($rotulo) ?></span>
+                    </button>
+                <?php endforeach; ?>
+            </div>
+            <!-- Enquanto não existe POP, só o DC/POP fica liberado (js/mapa.js, aplicarTravas). -->
+            <p class="ftth-sub ftth-trava" id="nc-trava" style="display:none">
+                <i class="bi-info-circle-fill"></i> Comece pelo POP: é dele que as fibras saem.
+                Os outros tipos se liberam assim que ele existir.</p>
+
+            <label class="ftth-rotulo-campo">Cor de identificação</label>
+            <div class="ftth-cores">
+                <?php foreach (Caixa::CORES as $i => $cor): ?>
+                    <button type="button" class="ftth-cor<?= $i === 4 ? ' ativo' : '' ?>"
+                            data-cor="<?= $cor ?>" style="background:<?= $cor ?>"></button>
+                <?php endforeach; ?>
+            </div>
+
+            <div id="nc-reserva-area" style="display:none">
+                <label class="ftth-rotulo-campo">Metros de reserva</label>
+                <input id="nc-reserva" class="ftth-campo" type="number" min="1" max="2000" step="0.5"
+                       placeholder="ex.: 30" style="max-width:140px">
+                <div class="ftth-sub" style="margin-top:4px">
+                    Somados ao comprimento óptico do cabo em que a reserva está.
+                </div>
+            </div>
+
+
+            <div id="nc-saida"></div>
+        </div>
+        <div class="ftth-modal-rodape">
+            <button class="ftth-btn ftth-btn--sec" id="nc-cancelar">Cancelar</button>
+            <button class="ftth-btn ftth-btn--pri" id="nc-criar">Criar ponto</button>
+        </div>
+    </div>
+</div>
+
+<!-- Nome da região: criar (passo 1) e renomear usam o mesmo modal. -->
+<div id="modal-regiao" class="ftth-modal" style="display:none">
+    <div class="ftth-modal-caixa">
+        <div class="ftth-modal-topo">
+            <strong><i class="bi-map"></i> <span id="rg-titulo">Nova região</span></strong>
+            <button class="ftth-painel-fechar" id="rg-fechar">&times;</button>
+        </div>
+        <div class="ftth-modal-corpo">
+            <label class="ftth-rotulo-campo">Nome da região</label>
+            <input id="rg-nome" class="ftth-campo" style="width:100%" maxlength="80"
+                   placeholder="ex.: Palmital">
+            <p class="ftth-sub" id="rg-nota" style="margin:8px 0 0"></p>
+            <div id="rg-saida"></div>
+        </div>
+        <div class="ftth-modal-rodape">
+            <button class="ftth-btn ftth-btn--sec" id="rg-cancelar">Cancelar</button>
+            <button class="ftth-btn ftth-btn--pri" id="rg-salvar">Continuar</button>
+        </div>
+    </div>
+</div>
+
+<!-- Emendar a caixa no cabo. Aparece sozinho quando a caixa cai em cima de um traçado, porque
+     a resposta certa depende do que o técnico foi fazer: documentar uma emenda que existe na
+     rua, ou só marcar um poste que fica ao lado do cabo. Por isso ninguém decide por ele. -->
+<div id="modal-emenda" class="ftth-modal" style="display:none">
+    <div class="ftth-modal-caixa">
+        <div class="ftth-modal-topo">
+            <!-- O mesmo modal pergunta sobre emenda, ponta livre ou vínculo no meio do cabo. -->
+            <strong id="em-titulo"><i class="bi-scissors"></i> Emendar no cabo?</strong>
+            <button class="ftth-painel-fechar" id="em-fechar">&times;</button>
+        </div>
+        <div class="ftth-modal-corpo">
+            <p id="em-texto" style="margin:0 0 10px"></p>
+            <p class="ftth-sub" id="em-explica-ancora" style="margin:0;display:none">
+                O cabo passa a terminar neste ponto: o traçado vai até ele e a ponta livre sai.
+                Nenhuma fibra é cortada. As fusões você faz depois, no diagrama do ponto.
+                Só é gravado no Concluir.
+            </p>
+            <p class="ftth-sub" id="em-explica-meio" style="margin:0;display:none">
+                Depois você escolherá uma CTO, CEO ou outro ponto existente. Antes de gravar,
+                o mapa mostrará o impacto e pedirá uma segunda confirmação.
+            </p>
+            <p class="ftth-sub" id="em-explica-emenda" style="margin:0">
+                Se você emendar: o cabo é cortado em dois trechos que passam a chegar nesta
+                caixa, <strong>a caixa encosta no traçado</strong> e todas as fibras atravessam
+                como passagem — sem perda e sem mexer no que já estava fundido nas pontas.
+                Depois, no diagrama da caixa, você troca por fusão ou sangria o que precisar.
+            </p>
+            <div id="em-saida" style="margin-top:10px"></div>
+        </div>
+        <div class="ftth-modal-rodape">
+            <button class="ftth-btn ftth-btn--sec" id="em-nao">Deixar solta</button>
+            <button class="ftth-btn ftth-btn--pri" id="em-sim">Emendar no cabo</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal de editar cabo: atributos só. O traçado não se mexe aqui (decisão de 22/09/2026). -->
+<!-- Exportar KMZ (aba Ajustes): os tipos marcados, da região aberta ou de todas. -->
+<div id="modal-exportar" class="ftth-modal" style="display:none">
+    <div class="ftth-modal-caixa">
+        <div class="ftth-modal-topo">
+            <strong><i class="bi-download"></i> Exportar KMZ</strong>
+            <button class="ftth-painel-fechar" id="exp-fechar">&times;</button>
+        </div>
+        <div class="ftth-modal-corpo">
+            <p class="ftth-gaveta-secao ftth-gaveta-secao--acao">O que vai no arquivo
+                <button type="button" id="exp-todos">Desmarcar todos</button></p>
+            <?php foreach (['CTO' => 'CTO', 'CEO' => 'CEO', 'DC' => 'DC / POP', 'PREDIO' => 'Prédio',
+                            'PROBLEMA' => 'Problema', 'RESERVA' => 'Reserva', 'POSTE' => 'Postes',
+                            'CABOS' => 'Cabos'] as $exp => $rotuloExp): ?>
+                <label class="ftth-gaveta-opcao"><input type="checkbox" class="exp-tipo" value="<?= $exp ?>">
+                    <?= htmlspecialchars($rotuloExp) ?></label>
+            <?php endforeach; ?>
+            <label class="ftth-gaveta-opcao" style="border-top:1px solid var(--ftth-borda);margin-top:6px;padding-top:10px">
+                <input type="checkbox" id="exp-todas"> Todas as regiões
+                <small>uma pasta por região no mesmo arquivo</small></label>
+            <p class="ftth-sub" id="exp-conta" style="margin:8px 0 0"></p>
+            <div id="exp-saida"></div>
+        </div>
+        <div class="ftth-modal-rodape">
+            <button class="ftth-btn ftth-btn--sec" id="exp-cancelar">Cancelar</button>
+            <button class="ftth-btn ftth-btn--pri" id="exp-baixar" disabled>
+                <i class="bi-download"></i> Baixar KMZ</button>
+        </div>
+    </div>
+</div>
+
+<!-- Cor em lote (modo Selecionar): a mesma paleta do cadastro de ponto. -->
+<div id="modal-cor-lote" class="ftth-modal" style="display:none">
+    <div class="ftth-modal-caixa">
+        <div class="ftth-modal-topo">
+            <strong><i class="bi-palette-fill"></i> Mudar cor</strong>
+            <button class="ftth-painel-fechar" id="lc-fechar">&times;</button>
+        </div>
+        <div class="ftth-modal-corpo">
+            <p class="ftth-sub" id="lc-texto" style="margin:0 0 10px"></p>
+            <!-- Ponto e cabo têm paletas diferentes; lado sem cor escolhida fica como está. -->
+            <div id="lc-bloco-pontos">
+                <label class="ftth-rotulo-campo">Cor dos pontos</label>
+                <div class="ftth-cores" id="lc-cores">
+                    <?php foreach (Caixa::NOMES_CORES as $hex => $nomeCor): ?>
+                        <button type="button" class="ftth-cor" data-cor="<?= $hex ?>"
+                                title="<?= htmlspecialchars($nomeCor) ?>" style="background:<?= $hex ?>"></button>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+            <div id="lc-bloco-cabos">
+                <label class="ftth-rotulo-campo">Cor dos cabos</label>
+                <div class="ftth-cores" id="lc-cores-cabo">
+                    <?php foreach (Cabo::CORES_ROTA as $hex => $nomeCor): ?>
+                        <button type="button" class="ftth-cor" data-cor="<?= $hex ?>"
+                                title="<?= htmlspecialchars($nomeCor) ?>" style="background:<?= $hex ?>"></button>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+            <div id="lc-saida"></div>
+        </div>
+        <div class="ftth-modal-rodape">
+            <button class="ftth-btn ftth-btn--sec" id="lc-cancelar">Cancelar</button>
+            <button class="ftth-btn ftth-btn--pri" id="lc-aplicar" disabled>
+                <i class="bi-check-circle-fill"></i> Aplicar</button>
+        </div>
+    </div>
+</div>
+
+<!-- Exclusão em lote: a prévia vem do servidor (Lote::previa) e é exatamente o que ele faz. -->
+<div id="modal-lote" class="ftth-modal" style="display:none">
+    <div class="ftth-modal-caixa">
+        <div class="ftth-modal-topo">
+            <strong><i class="bi-trash3-fill"></i> Excluir seleção</strong>
+            <button class="ftth-painel-fechar" id="lote-fechar">&times;</button>
+        </div>
+        <div class="ftth-modal-corpo">
+            <div id="lote-previa"></div>
+            <div id="lote-confirma" style="display:none">
+                <label class="ftth-rotulo-campo" for="lote-confirmacao">
+                    Para confirmar, digite <b>EXCLUIR</b></label>
+                <input id="lote-confirmacao" class="ftth-campo" style="width:100%" autocomplete="off">
+            </div>
+            <div id="lote-saida"></div>
+        </div>
+        <div class="ftth-modal-rodape">
+            <button class="ftth-btn ftth-btn--sec" id="lote-cancelar">Cancelar</button>
+            <button class="ftth-btn ftth-btn--perigo" id="lote-excluir">
+                <i class="bi-trash3-fill"></i> Excluir</button>
+        </div>
+    </div>
+</div>
+
+<!-- Excluir cabo: mesmo desenho do "Excluir seleção"; a prévia vem de Cabo::previaExclusao. -->
+<div id="modal-excluir-cabo" class="ftth-modal" style="display:none">
+    <div class="ftth-modal-caixa">
+        <div class="ftth-modal-topo">
+            <strong><i class="bi-trash3-fill"></i> Excluir cabo</strong>
+            <button class="ftth-painel-fechar" id="xc-fechar">&times;</button>
+        </div>
+        <div class="ftth-modal-corpo">
+            <div id="xc-previa"></div>
+            <div id="xc-saida"></div>
+        </div>
+        <div class="ftth-modal-rodape">
+            <button class="ftth-btn ftth-btn--sec" id="xc-cancelar">Cancelar</button>
+            <button class="ftth-btn ftth-btn--perigo" id="xc-excluir">
+                <i class="bi-trash3-fill"></i> Excluir</button>
+        </div>
+    </div>
+</div>
+
+<div id="modal-editar-cabo" class="ftth-modal" style="display:none">
+    <div class="ftth-modal-caixa">
+        <div class="ftth-modal-topo">
+            <strong><i class="bi-share-fill"></i> <span id="ec-titulo">Editar cabo</span></strong>
+            <button class="ftth-painel-fechar" id="ec-fechar">&times;</button>
+        </div>
+        <div class="ftth-modal-corpo">
+            <p class="ftth-sub" id="ec-rota" style="margin:0 0 4px"></p>
+
+            <label class="ftth-rotulo-campo">Nome do cabo (opcional)</label>
+            <input id="ec-nome" class="ftth-campo" style="width:100%" maxlength="80">
+
+            <label class="ftth-rotulo-campo">Fabricante (opcional)</label>
+            <input id="ec-fabricante" class="ftth-campo" style="width:100%" maxlength="60">
+
+            <div class="row g-3">
+                <div class="col-7">
+                    <label class="ftth-rotulo-campo">Capacidade (fibras)</label>
+                    <select id="ec-tipo" class="ftth-campo" style="width:100%">
+                        <?php foreach (Cabo::tipos() as $t): ?>
+                            <option value="<?= (int) $t['id'] ?>"><?= htmlspecialchars($t['rotulo']) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="col-5">
+                    <label class="ftth-rotulo-campo">Padrão de cores</label>
+                    <select id="ec-padrao" class="ftth-campo" style="width:100%">
+                        <?php foreach (Cabo::PADROES_COR as $p): ?>
+                            <option value="<?= $p ?>"><?= $p ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+            </div>
+
+            <label class="ftth-rotulo-campo">Cor da rota</label>
+            <div class="ftth-cores" id="ec-cores">
+                <?php foreach (['#00E676', '#00BCD4', '#0D47A1', '#FF9100', '#E53935',
+                                '#8E24AA', '#FDD835', '#212121', '#9E9E9E'] as $cor): ?>
+                    <button type="button" class="ftth-cor" data-cor="<?= $cor ?>"
+                            style="background:<?= $cor ?>"></button>
+                <?php endforeach; ?>
+            </div>
+
+            <label class="ftth-rotulo-campo">Espessura da rota no mapa</label>
+            <select id="ec-espessura" class="ftth-campo" style="width:100%">
+                <option value="">Padrão do mapa (<?= (int) Config::num('mapa_cabo_espessura', 5) ?> px)</option>
+                <?php for ($px = 1; $px <= 12; $px++): ?>
+                    <option value="<?= $px ?>"><?= $px ?> px</option>
+                <?php endfor; ?>
+            </select>
+
+            <label class="ftth-rotulo-campo">Situação</label>
+            <select id="ec-status" class="ftth-campo" style="width:100%">
+                <option value="projeto">Projeto</option>
+                <option value="implantado">Implantado</option>
+                <option value="certificado">Certificado</option>
+            </select>
+
+            <p class="ftth-sub" style="margin-top:10px">
+                Para mudar o caminho do cabo no mapa, desenhe um cabo novo — aqui só mudam
+                os dados dele.
+            </p>
+
+            <div id="ec-saida"></div>
+        </div>
+        <div class="ftth-modal-rodape">
+            <button class="ftth-btn ftth-btn--sec" id="ec-cancelar">Cancelar</button>
+            <button class="ftth-btn ftth-btn--pri" id="ec-salvar">Salvar cabo</button>
+        </div>
+    </div>
+</div>
+
+<!-- Clientes na porta: a grade do splitter de atendimento da caixa. É aqui que a
+     documentação encontra o cadastro — cada porta aponta para um sis_cliente.id. -->
+<div id="modal-clientes" class="ftth-modal" style="display:none">
+    <div class="ftth-modal-caixa ftth-modal-caixa--larga">
+        <div class="ftth-modal-topo">
+            <strong><i class="bi-people-fill"></i> <span id="cl-titulo">Clientes na caixa</span></strong>
+            <button class="ftth-painel-fechar" id="cl-fechar">&times;</button>
+        </div>
+        <div class="ftth-modal-corpo">
+            <div id="cl-corpo"></div>
+        </div>
+        <div class="ftth-modal-rodape">
+            <span class="ftth-sub" id="cl-resumo" style="margin:0 auto 0 0"></span>
+            <button class="ftth-btn ftth-btn--sec" id="cl-cancelar">Fechar</button>
+        </div>
+    </div>
+</div>
+
+<!-- Cadastro, localizações e vínculos do cliente selecionado no mapa. -->
+<div id="modal-cliente-mapa" class="ftth-modal" style="display:none">
+    <div class="ftth-modal-caixa ftth-modal-caixa--larga ftth-modal-cliente-mapa">
+        <div class="ftth-modal-topo">
+            <strong><i class="bi-people-fill"></i> <span id="cliente-mapa-titulo">Cliente e instalações</span></strong>
+            <button class="ftth-painel-fechar" id="cliente-mapa-fechar" aria-label="Fechar">&times;</button>
+        </div>
+        <div class="ftth-modal-corpo" id="cliente-mapa-corpo"></div>
+        <div class="ftth-modal-rodape">
+            <button class="ftth-btn ftth-btn--sec" id="cliente-mapa-cancelar">Fechar</button>
+        </div>
+    </div>
+</div>
+
+<!-- Rota óptica: o mesmo cálculo que o diagrama mostra na ponta da fibra, aqui a partir
+     da caixa inteira. Quem investiga um cliente no mapa vê de onde vem o sinal sem ter
+     de abrir o diagrama e caçar a ponta certa. -->
+<div id="modal-rota" class="ftth-modal" style="display:none">
+    <div class="ftth-modal-caixa">
+        <div class="ftth-modal-topo">
+            <strong><i class="bi-reception-4"></i> <span id="rt-titulo">Rota óptica</span></strong>
+            <button class="ftth-painel-fechar" id="rt-fechar">&times;</button>
+        </div>
+        <div class="ftth-modal-corpo">
+            <div id="rt-corpo"></div>
+        </div>
+        <div class="ftth-modal-rodape">
+            <button class="ftth-btn ftth-btn--sec" id="rt-cancelar">Fechar</button>
+        </div>
+    </div>
+</div>
+
+<script>
+window.FTTH_MAPA = {
+    csrf:   <?= json_encode(ftth_csrf_token()) ?>,
+    regiao: <?= $regiaoInicial ? (int) $regiaoInicial['id'] : 0 ?>,
+    // Todas as regiões, com a moldura dos pontos: o mapa se posiciona por elas.
+    regioes: <?= json_encode($regioes, JSON_UNESCAPED_UNICODE) ?>,
+    tipo:   <?= json_encode((string) Config::get('mapa_tipo', 'hybrid')) ?>,
+    rotulo_zoom:   <?= (int) Config::num('mapa_rotulo_zoom', 17) ?>,
+    cabo_espessura:   <?= (int) Config::num('mapa_cabo_espessura', 5) ?>,
+    cabo_espessura_q: <?= (int) Config::num('mapa_cabo_espessura_q', 4) ?>,
+    raio_viabilidade_m: <?= (int) Config::num('raio_busca_comercial_m', 300) ?>,
+    // Uma fonte só para o desenho: o marcador e a ficha trocam o {cor} por conta própria.
+    silhuetas: <?= json_encode(Caixa::SILHUETAS, JSON_UNESCAPED_SLASHES) ?>,
+    // Primeiros passos: o mesmo estado que mapa.php?ajax=passos devolve depois.
+    passos: <?= json_encode($passos, JSON_UNESCAPED_UNICODE) ?>,
+    // Camadas do usuário (Ajustes::camadas): o mapa já nasce com o que ele deixou marcado.
+    camadas: <?= json_encode($camadasUsuario) ?>,
+    otdr: <?= json_encode($otdrEstimativa, JSON_UNESCAPED_UNICODE) ?>,
+    foco_vao: <?= json_encode($focoVao, JSON_UNESCAPED_UNICODE) ?>
+};
+</script>
+<script src="js/mapa.js?v=<?= time() ?>"></script>
+<script src="js/viabilidade.js?v=<?= time() ?>"></script>
+<script src="js/onboarding.js?v=<?= time() ?>"></script>
+<?php if ($chave !== ''): ?>
+<script async defer
+    src="https://maps.googleapis.com/maps/api/js?key=<?= rawurlencode($chave) ?>&callback=ftthIniciarMapa&language=pt-BR&region=BR"></script>
+<?php endif; ?>
+
+<?php include('../../baixo.php'); ?>
+<script src="../../menu.js<?= $ext_mk ?>"></script>
+</body>
+</html>
