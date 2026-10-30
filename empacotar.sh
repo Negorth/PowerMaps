@@ -38,6 +38,7 @@ tar cf - \
     --exclude='./logs' \
     --exclude='./systemd' \
     --exclude='./.git*' \
+    --exclude='./.gitattributes' \
     --exclude='./addons.class.php' \
     --exclude='./empacotar.sh' \
     --exclude='./instalar.sh' \
