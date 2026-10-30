@@ -18,6 +18,7 @@ require_once __DIR__ . '/lib/PrimeirosPassos.php';
 require_once __DIR__ . '/lib/Lote.php';
 require_once __DIR__ . '/lib/KmzExport.php';
 require_once __DIR__ . '/lib/Viabilidade.php';
+require_once __DIR__ . '/lib/Atualizador.php';
 
 /**
  * Os parâmetros da exportação, iguais para contar e para baixar. Com `caixas` (modo
@@ -140,7 +141,18 @@ if (isset($_GET['ajax'])) {
 
             // Só quando a aba Ajustes abre: não pesa a abertura do mapa.
             case 'estado':
-                Resultado::ok(Ajustes::estado())->enviar();
+                Resultado::ok(Ajustes::estado() + ['atualizador' => Atualizador::estado()])->enviar();
+
+            case 'atualizador_estado':
+                Resultado::ok(Atualizador::estado())->enviar();
+
+            case 'atualizar_solicitar':
+                ftth_exigir_csrf();
+                try {
+                    Resultado::ok(Atualizador::solicitar())->enviar();
+                } catch (RuntimeException $e) {
+                    Resultado::erro('FTTH-SYS-002', [], $e->getMessage())->enviar(503);
+                }
 
             case 'pontos':
                 Resultado::ok(['pontos' => Mapa::pontos((int) ($_GET['regiao'] ?? 0))])->enviar();
@@ -1030,12 +1042,6 @@ include('nav/header.php');
 
                 <div class="ftth-gaveta-rodape ftth-estado" id="estado-banco">
                     <p class="ftth-gaveta-vazio" style="padding:0">Lendo o estado do banco…</p>
-                </div>
-                <!-- Fora do #estado-banco, que o JS reescreve a cada leitura. -->
-                <div class="ftth-gaveta-rodape ftth-autor">
-                    <span>By <strong>Marcelo Silvestro</strong></span>
-                    <a href="https://wa.me/5542984277951" target="_blank" rel="noopener"
-                       title="Falar no WhatsApp" aria-label="WhatsApp"><i class="bi-whatsapp"></i></a>
                 </div>
             </section>
         </aside>

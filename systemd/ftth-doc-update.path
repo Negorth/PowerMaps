@@ -1,0 +1,9 @@
+[Unit]
+Description=Detecta pedidos de atualização do FTTH Doc
+
+[Path]
+PathChanged=/opt/mk-auth/dados/ftth_doc/update.request
+Unit=ftth-doc-update.service
+
+[Install]
+WantedBy=multi-user.target

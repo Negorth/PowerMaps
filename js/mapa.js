@@ -3985,10 +3985,13 @@
                   +   '<dt>Versão do addon</dt><dd>' + esc(e.addon || '—') + '</dd>'
                   +   (e.aposentadas ? '<dt>Aposentadas</dt><dd>' + e.aposentadas + ' a remover</dd>' : '')
                   + '</dl>'
-                  + '<div class="ftth-estado-atualizacao" id="estado-atualizacao">'
+                  + '<div class="ftth-estado-atualizacao" id="estado-atualizacao" aria-live="polite">'
                   +   '<button type="button" class="ftth-onb-link" id="estado-verificar">'
                   +     '<i class="bi-arrow-repeat"></i> Verificar atualização</button></div>');
                 estadoAtual = e;
+                if (e.atualizador && (e.atualizador.estado === 'pending' || e.atualizador.estado === 'running')) {
+                    acompanharAtualizacao();
+                }
             },
             onErro: function (m) {
                 $('#estado-banco').html('<div class="ftth-aviso ftth-aviso--erro">' + esc(m) + '</div>');
@@ -3997,6 +4000,8 @@
     }
 
     var estadoAtual = null;   // o último estado lido: versão instalada, instalador, release
+    var timerAtualizacao = null;
+    var recargaAtualizacaoAgendada = false;
 
     /** "0.9.10" > "0.9.9": compara número a número, não como texto. */
     function versaoMaior(a, b) {
@@ -4007,6 +4012,14 @@
             if (x !== y) return x > y;
         }
         return false;
+    }
+
+    function htmlInstaladorManual(texto) {
+        var comando = estadoAtual && estadoAtual.instalador ? estadoAtual.instalador : '';
+        if (!comando) return '';
+        return '<p class="ftth-sub" style="margin:6px 0 4px">' + esc(texto) + '</p>'
+            + '<div class="ftth-estado-cmd"><code id="estado-cmd">' + esc(comando) + '</code>'
+            +   '<button type="button" class="ftth-copiar" id="estado-copiar">copiar</button></div>';
     }
 
     /**
@@ -4022,22 +4035,41 @@
 
         $.ajax({ url: e.ultima_url, dataType: 'json', timeout: 10000, cache: false })
             .done(function (r) {
-                var ultima = String((r && r.tag_name) || '').replace(/^v/i, '');
-                if (!ultima) { falhou(); return; }
+                var tag = String((r && r.tag_name) || '');
+                if (!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag) || !r || r.draft || r.prerelease) { falhou(); return; }
+                var ultima = tag.slice(1);
                 if (!versaoMaior(ultima, e.addon)) {
-                    $a.html('<span class="ftth-estado-ok"><i class="bi-check-circle-fill"></i> '
-                        + 'Você está na versão mais recente (' + esc(e.addon) + ').</span>');
+                    var atual = '<span class="ftth-estado-ok"><i class="bi-check-circle-fill"></i> '
+                        + 'Você está na versão mais recente (' + esc(e.addon) + ').</span>';
+                    if (!e.atualizador || !e.atualizador.configurado) {
+                        atual += htmlInstaladorManual('Para habilitar o botão, rode uma vez o instalador como root no servidor:');
+                    }
+                    $a.html(atual);
                     return;
                 }
                 var data = r.published_at ? new Date(r.published_at).toLocaleDateString('pt-BR') : '';
-                $a.html('<div class="ftth-estado-novo"><i class="bi-arrow-up-circle-fill"></i> '
+                var nomePacote = 'ftth_doc-' + ultima + '.tar.gz';
+                var digest = '';
+                (Array.isArray(r.assets) ? r.assets : []).forEach(function (asset) {
+                    if (asset && asset.name === nomePacote) digest = String(asset.digest || '');
+                });
+                var pacoteVerificado = /^sha256:[a-f0-9]{64}$/i.test(digest);
+                var html = '<div class="ftth-estado-novo"><i class="bi-arrow-up-circle-fill"></i> '
                     + 'Versão <strong>' + esc(ultima) + '</strong> disponível'
                     + (data ? ' (' + esc(data) + ')' : '')
                     + (r.html_url ? ' · <a href="' + esc(r.html_url) + '" target="_blank" rel="noopener">o que mudou</a>' : '')
-                    + '</div>'
-                    + '<p class="ftth-sub" style="margin:4px 0">Para atualizar, rode no terminal do servidor:</p>'
-                    + '<div class="ftth-estado-cmd"><code id="estado-cmd">' + esc(e.instalador) + '</code>'
-                    +   '<button type="button" class="ftth-copiar" id="estado-copiar">copiar</button></div>');
+                    + '</div>';
+
+                if (e.atualizador && e.atualizador.configurado && pacoteVerificado) {
+                    html += '<p class="ftth-sub" style="margin:4px 0">O instalador fará backup antes de aplicar a atualização.</p>'
+                        + '<button type="button" class="ftth-onb-link ftth-atualizar-agora" id="estado-atualizar"'
+                        + ' data-versao="' + esc(ultima) + '"><i class="bi-cloud-arrow-down"></i> Atualizar agora</button>';
+                } else {
+                    html += htmlInstaladorManual(e.atualizador && e.atualizador.configurado
+                        ? 'A release não publicou um digest verificável. Use o instalador manual:'
+                        : 'Para habilitar o botão, rode uma vez o instalador como root no servidor:');
+                }
+                $a.html(html);
             })
             .fail(falhou);
 
@@ -4045,6 +4077,77 @@
             $a.html('<span class="ftth-sub" style="margin:0">Não foi possível consultar o GitHub agora. '
                 + '<button type="button" class="ftth-onb-link" id="estado-verificar">Tentar de novo</button></span>');
         }
+    }
+
+    function solicitarAtualizacao(versao) {
+        var cfg = window.FTTH_MAPA || {};
+        if (!window.confirm('Atualizar o FTTH Doc para a versão ' + versao + '? O instalador fará backup do código e do banco antes de aplicar as mudanças.')) return;
+
+        $('#estado-atualizar').prop('disabled', true).attr('aria-busy', 'true');
+        $('#estado-atualizacao').html('<span class="ftth-sub" role="status" style="margin:0"><i class="bi-arrow-repeat"></i> Enviando solicitação…</span>');
+        FTTH.chamar({
+            url: 'mapa.php?ajax=atualizar_solicitar',
+            method: 'POST',
+            data: { csrf: cfg.csrf },
+            onOk: function () { acompanharAtualizacao(); },
+            onErro: function (mensagem) {
+                $('#estado-atualizacao').html('<span class="ftth-aviso ftth-aviso--erro" role="alert">'
+                    + esc(mensagem) + '</span>'
+                    + htmlInstaladorManual('Se o auxiliar não responder, use o instalador manual:'));
+            }
+        });
+    }
+
+    function acompanharAtualizacao() {
+        if (timerAtualizacao) window.clearTimeout(timerAtualizacao);
+        var inicio = Date.now();
+
+        function consultar() {
+            FTTH.chamar({
+                url: 'mapa.php?ajax=atualizador_estado',
+                onOk: function (estado) {
+                    if (estado.estado === 'succeeded') {
+                        if (timerAtualizacao) window.clearTimeout(timerAtualizacao);
+                        $('#estado-atualizacao').html('<span class="ftth-estado-ok" role="status"><i class="bi-check-circle-fill"></i> '
+                            + 'Atualização concluída para ' + esc(estado.versao || 'a versão mais recente') + '. Recarregando…</span>');
+                        if (!recargaAtualizacaoAgendada) {
+                            recargaAtualizacaoAgendada = true;
+                            window.setTimeout(function () { window.location.reload(); }, 1800);
+                        }
+                        return;
+                    }
+                    if (estado.estado === 'failed') {
+                        if (timerAtualizacao) window.clearTimeout(timerAtualizacao);
+                        $('#estado-atualizacao').html('<span class="ftth-aviso ftth-aviso--erro" role="alert">'
+                            + esc(estado.mensagem || 'A atualização falhou.') + '</span>'
+                            + '<button type="button" class="ftth-onb-link" id="estado-verificar">Verificar novamente</button>'
+                            + htmlInstaladorManual('Confira o log do servidor ou use o instalador manual:'));
+                        return;
+                    }
+                    if (Date.now() - inicio > 900000) {
+                        $('#estado-atualizacao').html('<span class="ftth-sub" role="status">'
+                            + 'A tarefa ainda não terminou. Confira o estado novamente em instantes.</span>'
+                            + htmlInstaladorManual('Se o auxiliar não responder, use o instalador manual:'));
+                        return;
+                    }
+                    var texto = estado.estado === 'running' ? 'Instalando a atualização…' : 'Na fila de atualização…';
+                    $('#estado-atualizacao').html('<span class="ftth-sub" role="status" style="margin:0"><i class="bi-arrow-repeat"></i> '
+                        + texto + '</span>');
+                    timerAtualizacao = window.setTimeout(consultar, 3000);
+                },
+                onErro: function () {
+                    if (Date.now() - inicio > 900000) {
+                        $('#estado-atualizacao').html('<span class="ftth-sub" role="status">'
+                            + 'Não foi possível consultar o andamento. Confira o estado novamente em instantes.</span>'
+                            + htmlInstaladorManual('Se precisar, use o instalador manual:'));
+                        return;
+                    }
+                    timerAtualizacao = window.setTimeout(consultar, 5000);
+                }
+            });
+        }
+
+        consultar();
     }
 
     /**
@@ -4302,6 +4405,9 @@
         // --- aba Ajustes
         $('#aj-salvar').on('click', salvarAjustes);
         $('#estado-banco').on('click', '#estado-verificar', verificarAtualizacao);
+        $('#estado-banco').on('click', '#estado-atualizar', function () {
+            solicitarAtualizacao(String($(this).data('versao') || 'mais recente'));
+        });
         $('#estado-banco').on('click', '#estado-copiar', function () {
             var texto = $('#estado-cmd').text();
             var $b = $(this);

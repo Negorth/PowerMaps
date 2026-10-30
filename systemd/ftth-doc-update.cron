@@ -1,0 +1,5 @@
+# FTTH Doc: processa somente o marcador fixo de atualização, como root.
+# Usado em servidores sem systemd; o worker ignora execuções sem pedido pendente.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+* * * * * root /usr/local/sbin/ftth-doc-update-worker.sh >/dev/null 2>&1

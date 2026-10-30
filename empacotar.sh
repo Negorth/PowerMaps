@@ -26,7 +26,7 @@ DESTINO="pacote"
 NOME="ftth_doc-$VERSAO.tar.gz"
 
 rm -rf "$DESTINO/staging"
-mkdir -p "$DESTINO/staging"
+mkdir -p "$DESTINO/staging/ftth_doc"
 
 # Copia o addon inteiro e depois remove o que nao vai. Copiar o que fica daria uma lista que
 # envelhece a cada arquivo novo; remover o que sai e uma lista que so muda de proposito.
@@ -36,32 +36,41 @@ tar cf - \
     --exclude='./pacote' \
     --exclude='./uploads' \
     --exclude='./logs' \
+    --exclude='./systemd' \
     --exclude='./.git*' \
     --exclude='./addons.class.php' \
     --exclude='./empacotar.sh' \
     --exclude='./instalar.sh' \
     --exclude='./README.md' \
     --exclude='*.bak' \
-    . | (cd "$DESTINO/staging" && tar xf -)
+    . | (cd "$DESTINO/staging/ftth_doc" && tar xf -)
 
 # Conferencia: o que nao pode estar la, e o que nao pode faltar.
 for proibido in tests sql/historico addons.class.php; do
-    if [ -e "$DESTINO/staging/$proibido" ]; then
+    if [ -e "$DESTINO/staging/ftth_doc/$proibido" ]; then
         echo "ERRO: $proibido entrou no pacote"; exit 1
     fi
 done
 for obrigatorio in LICENSE manifest.json config.php mapa.php index.php lib/Schema.php sql/baseline.sql \
                    sql/limpeza.sql cli/schema.php cli/diagnostico.php nav/header.php \
                    css/ftth.css js/mapa.js; do
-    if [ ! -e "$DESTINO/staging/$obrigatorio" ]; then
+    if [ ! -e "$DESTINO/staging/ftth_doc/$obrigatorio" ]; then
         echo "ERRO: falta $obrigatorio no pacote"; exit 1
     fi
 done
 
-# A pasta dentro do tar chama-se ftth_doc/, para o instalador extrair e mover de uma vez.
-rm -rf "$DESTINO/ftth_doc"
-mv "$DESTINO/staging" "$DESTINO/ftth_doc"
-(cd "$DESTINO" && tar czf "$NOME" ftth_doc && rm -rf ftth_doc)
+# O asset carrega o addon, o instalador correspondente e os arquivos do auxiliar root-owned.
+for obrigatorio in instalar.sh systemd/ftth-doc-update-worker.sh \
+                   systemd/ftth-doc-update.cron \
+                   systemd/ftth-doc-update.path systemd/ftth-doc-update.service; do
+    if [ ! -e "$obrigatorio" ]; then
+        echo "ERRO: falta $obrigatorio"; exit 1
+    fi
+done
+cp -p instalar.sh "$DESTINO/staging/instalar.sh"
+cp -a systemd "$DESTINO/staging/systemd"
+(cd "$DESTINO/staging" && tar czf "../$NOME" ftth_doc instalar.sh systemd)
+rm -rf "$DESTINO/staging"
 (cd "$DESTINO" && sha256sum "$NOME" > SHA256SUMS)
 
 echo "pacote/$NOME"

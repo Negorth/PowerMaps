@@ -1,0 +1,31 @@
+[Unit]
+Description=Atualizador restrito do FTTH Doc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0027
+ExecStart=/usr/local/sbin/ftth-doc-update-worker.sh
+TimeoutStartSec=15min
+RuntimeDirectory=ftth-doc-update
+RuntimeDirectoryMode=0750
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/opt/mk-auth/admin/addons
+ReadWritePaths=/opt/mk-auth/conf
+ReadWritePaths=/opt/mk-auth/dados/ftth_doc
+ReadWritePaths=/opt/mk-auth/log/ftth_doc
+ReadWritePaths=/opt/mk-auth/bckp/ftth_doc

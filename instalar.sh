@@ -64,6 +64,7 @@ DB_USER=""
 DB_PASS=""
 DB_HOST=127.0.0.1
 DUMP=""
+PACOTE_ROOT=""
 declare -a DESFAZER=()
 
 # argumentos
@@ -300,6 +301,12 @@ baixar_pacote() {
     done
 
     echo "$raiz" > "$TMP/raiz"
+    if [ -d "$raiz/systemd" ]; then
+        PACOTE_ROOT="$raiz"
+    elif [ -d "$staging/systemd" ]; then
+        PACOTE_ROOT="$staging"
+    fi
+    echo "$PACOTE_ROOT" > "$TMP/pacote_raiz"
     ok "pacote $VERSAO_ALVO baixado e conferido"
 }
 
@@ -532,6 +539,83 @@ criar_diretorios() {
     fi
 }
 
+instalar_atualizador() {
+    local origem="${PACOTE_ROOT:-}" worker path_unit service_unit cron_job marcador_tmp arquivo ativado=0
+    [ -n "$origem" ] || { info "pacote sem auxiliar de atualização; mantendo o instalador manual"; return 0; }
+
+    # O worker não pode reescrever o próprio executável nem unidades em /etc enquanto roda.
+    # O auxiliar é instalado no primeiro setup root e só pode ser atualizado por nova execução
+    # manual do instalador como root.
+    if [ "${FTTH_UPDATE_WORKER:-0}" = 1 ] && [ -f "$DADOS/update-helper.ready" ] \
+        && [ ! -L "$DADOS/update-helper.ready" ]; then
+        info "auxiliar root preservado durante a atualização pelo painel"
+        return 0
+    fi
+
+    worker="$origem/systemd/ftth-doc-update-worker.sh"
+    path_unit="$origem/systemd/ftth-doc-update.path"
+    service_unit="$origem/systemd/ftth-doc-update.service"
+    cron_job="$origem/systemd/ftth-doc-update.cron"
+    for arquivo in "$worker" "$path_unit" "$service_unit" "$cron_job"; do
+        [ -f "$arquivo" ] || { info "arquivos do auxiliar incompletos; mantendo o instalador manual"; return 0; }
+    done
+
+    # O serviço recebe escrita somente na pasta de backup deste addon, não em todo o bckp.
+    if ! install -d -o root -g root -m 0700 "$BCKP"; then
+        aviso "não foi possível preparar a pasta de backup; as atualizações continuam pelo instalador manual"
+        return 0
+    fi
+
+    if ! install -d -o root -g root -m 0755 /usr/local/sbin \
+        || ! install -o root -g root -m 0750 "$worker" /usr/local/sbin/ftth-doc-update-worker.sh; then
+        aviso "não foi possível instalar os arquivos do auxiliar; as atualizações continuam pelo instalador manual"
+        return 0
+    fi
+
+    # Prefere systemd com confinamento de escrita. MK-AUTH em Debian 10 pode usar init
+    # tradicional; nesse caso, usa um cron.d fixo, executado só pelo root, como alternativa.
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        if install -o root -g root -m 0644 "$path_unit" /etc/systemd/system/ftth-doc-update.path \
+            && install -o root -g root -m 0644 "$service_unit" /etc/systemd/system/ftth-doc-update.service \
+            && systemctl daemon-reload \
+            && systemctl enable --now ftth-doc-update.path; then
+            rm -f /etc/cron.d/ftth-doc-update
+            ativado=1
+        else
+            aviso "não foi possível ativar o auxiliar systemd; tentando o agendador cron"
+        fi
+    fi
+
+    if [ "$ativado" -eq 0 ] && [ -d /etc/cron.d ] \
+        && command -v pgrep >/dev/null 2>&1 && pgrep -x cron >/dev/null 2>&1; then
+        if install -o root -g root -m 0644 "$cron_job" /etc/cron.d/ftth-doc-update; then
+            ativado=1
+            ok "auxiliar root configurado pelo cron (verifica pedidos a cada minuto)"
+        else
+            aviso "não foi possível instalar a tarefa do cron; as atualizações continuam pelo instalador manual"
+        fi
+    fi
+
+    if [ "$ativado" -ne 1 ]; then
+        aviso "systemd ativo ou cron em execução não foi encontrado; as atualizações continuam pelo instalador manual"
+        return 0
+    fi
+
+    if ! marcador_tmp="$(mktemp "$DADOS/.update-helper.ready.XXXXXX")"; then
+        aviso "não foi possível gravar o estado do auxiliar; as atualizações continuam pelo instalador manual"
+        return 0
+    fi
+    if ! printf 'ftth-doc-update-v1\n' > "$marcador_tmp" \
+        || ! chown root:www-data "$marcador_tmp" \
+        || ! chmod 0640 "$marcador_tmp" \
+        || ! mv -fT "$marcador_tmp" "$DADOS/update-helper.ready"; then
+        rm -f "$marcador_tmp"
+        aviso "não foi possível marcar o auxiliar como pronto; as atualizações continuam pelo instalador manual"
+        return 0
+    fi
+    ok "auxiliar de atualização configurado"
+}
+
 ajustar_permissoes() {
     chown -R www-data:www-data "$DEST"
     find "$DEST" -type d -exec chmod 755 {} +
@@ -686,6 +770,14 @@ main() {
     else
         passo "Backup"
         backup_banco
+        # Se o addon ja esta na release mais recente, ainda pode faltar a configuracao root
+        # inicial. Baixe apenas os recursos do auxiliar: nao publique codigo nem reaplique dados.
+        if [ -n "$VERSAO_INSTALADA" ] \
+            && [ "${VERSAO_ALVO#v}" = "$VERSAO_INSTALADA" ] \
+            && { [ ! -f "$DADOS/update-helper.ready" ] || [ -L "$DADOS/update-helper.ready" ]; }; then
+            passo "Recursos do auxiliar de atualização"
+            baixar_pacote
+        fi
     fi
 
     instalar_classe
@@ -695,6 +787,9 @@ main() {
     passo "Schema do banco"
     aplicar_schema
     limpar_schema
+
+    passo "Atualização pelo painel"
+    instalar_atualizador
 
     passo "Menu do painel"
     registrar_menu

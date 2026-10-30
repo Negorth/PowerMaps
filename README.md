@@ -4,7 +4,7 @@ Addon para MK-AUTH que documenta a planta FTTH: caixas e cabos no mapa, importa�
 projeto, diagrama de emendas de cada CEO/CTO, POP com OLT e DIO, e cálculo de potência do sinal
 que chega em cada cliente.
 
-> **Versão 0.9.11 — versão mantida em Negorth/PowerMaps.** Derivada do FTTH Doc de Marcelo Silvestro, com o aviso de copyright e a licença MIT preservados. Esta é a
+> **Versão 0.9.12 — versão mantida em Negorth/PowerMaps.** Derivada do FTTH Doc de Marcelo Silvestro, com o aviso de copyright e a licença MIT preservados. Esta é a
 > versão atualmente mantida neste repositório. Instale primeiro num servidor de teste.
 
 ## Instalação
@@ -16,8 +16,12 @@ wget -O - https://raw.githubusercontent.com/Negorth/PowerMaps/main/instalar.sh |
 ```
 
 O script faz tudo: confere o ambiente, baixa a última versão, cria as tabelas, ajusta
-permissões e coloca o link no menu do painel. O mesmo comando também **atualiza** — rode de
-novo quando sair uma versão nova, que ele compara e só troca o que precisa.
+permissões e coloca o link no menu do painel. Na primeira instalação/atualização para a versão
+0.9.12, também configura um auxiliar root para futuras atualizações pelo painel. Em servidores
+com systemd, ele usa o serviço restrito; no MK-AUTH com init tradicional, usa uma tarefa cron
+fixa que verifica pedidos a cada minuto. Depois, use **Configurações → Verificar atualização →
+Atualizar agora**. Se nenhum agendador compatível estiver ativo, o comando manual continua
+disponível.
 
 Depois de instalar, entre no painel: **PROVEDOR → Documentação FTTH**.
 

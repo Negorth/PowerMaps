@@ -378,18 +378,14 @@ a.ftth-kpi:hover  { border-color: var(--ftth-azul-claro); background: #fff; }
                       font-size: 11.5px; }
 .ftth-estado-dados dt { color: var(--ftth-cinza); }
 .ftth-estado-dados dd { margin: 0; font-family: Consolas, "Courier New", monospace; text-align: right; }
-/* Quem desenvolve, no pé da aba Ajustes: discreto, mas com o WhatsApp a um clique. */
-.ftth-autor         { display: flex; align-items: center; gap: 6px; font-size: 12px;
-                      line-height: 1.4; padding: 7px 10px; color: var(--ftth-cinza); }
-.ftth-autor strong  { color: var(--ftth-azul); font-weight: 600; }
 /* Resultado do "Verificar atualização" no rodapé do Estado do banco. */
 .ftth-estado-atualizacao { margin-top: 6px; font-size: 12px; }
 .ftth-estado-atualizacao .ftth-onb-link i { margin-right: 3px; }
+.ftth-atualizar-agora { color: var(--ftth-azul); font-weight: 600; }
+.ftth-atualizar-agora:disabled { cursor: wait; opacity: .6; }
 .ftth-estado-ok     { color: var(--ftth-verde); font-weight: 600; }
 .ftth-estado-novo   { color: var(--ftth-azul); }
 .ftth-estado-novo i { color: var(--ftth-amarelo); margin-right: 3px; }
-.ftth-autor a       { color: var(--ftth-verde); text-decoration: none; font-size: 15px; line-height: 1; }
-.ftth-autor a:hover { opacity: .8; }
 .ftth-estado-cmd    { display: flex; align-items: center; gap: 6px; }
 .ftth-estado-cmd code { flex: 1; min-width: 0; font-size: 10.5px; background: #fff;
                         border: 1px solid var(--ftth-borda); border-radius: 4px; padding: 4px 6px;
