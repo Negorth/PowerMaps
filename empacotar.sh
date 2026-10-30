@@ -41,7 +41,6 @@ tar cf - \
     --exclude='./empacotar.sh' \
     --exclude='./instalar.sh' \
     --exclude='./README.md' \
-    --exclude='./LICENSE' \
     --exclude='*.bak' \
     . | (cd "$DESTINO/staging" && tar xf -)
 
@@ -51,7 +50,7 @@ for proibido in tests sql/historico addons.class.php; do
         echo "ERRO: $proibido entrou no pacote"; exit 1
     fi
 done
-for obrigatorio in manifest.json config.php mapa.php index.php lib/Schema.php sql/baseline.sql \
+for obrigatorio in LICENSE manifest.json config.php mapa.php index.php lib/Schema.php sql/baseline.sql \
                    sql/limpeza.sql cli/schema.php cli/diagnostico.php nav/header.php \
                    css/ftth.css js/mapa.js; do
     if [ ! -e "$DESTINO/staging/$obrigatorio" ]; then
