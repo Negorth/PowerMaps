@@ -44,7 +44,7 @@ CLASSE_ORIGEM="$MKAUTH/include/addons.inc.hhvm"
 
 # O acento vai como escape çã de proposito: o Apache serve o addon.js como
 # application/javascript SEM charset, e "Documentação" cru chega ao menu como "DocumentaÃ§Ã£o".
-MENU_MARCA="addons/$ADDON/"
+MENU_MARCA="minha_url + 'addons/$ADDON/"
 MENU_LINHA="add_menu.provedor('{\"plink\": \"' + minha_url + 'addons/$ADDON/mapa.php\", \"ptext\": \"Documenta\\u00e7\\u00e3o FTTH\"}');"
 
 # Senha de fabrica do MK-AUTH. Esta aqui para a instalacao rodar sozinha num servidor virgem;
@@ -664,10 +664,9 @@ registrar_menu() {
     # so a minha e acrescentar a minha no fim; nada de outro addon pode ser tocado.
     [ -f "$ADDONJS" ] || : > "$ADDONJS"
 
-    # Contar em duas etapas, nunca dentro da aritmetica: "grep -c" sem match imprime 0 E sai
-    # com 1, entao um "|| echo 0" na mesma substituicao produz DOIS zeros e a conta vira "0 0".
-    # So acontece em servidor que ainda nao tem a linha do addon — foi o que derrubou a
-    # primeira instalacao limpa, na VM zerada.
+    # O marcador aponta apenas para a URL da linha add_menu gerenciada por este instalador.
+    # Nao use apenas "addons/ftth_doc/": o addon.js tambem pode ter um link nativo do FTTH Doc,
+    # que nao e uma chamada add_menu e precisa permanecer intacto.
     local antes_outros antes_minhas bak
     antes_outros="$(grep -c 'add_menu\.' "$ADDONJS" 2>/dev/null || true)"
     antes_minhas="$(grep -c "$MENU_MARCA" "$ADDONJS" 2>/dev/null || true)"
